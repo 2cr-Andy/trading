@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 from market_scanner import MarketScanner
+import pytz
 
 # 환경 변수 로드
 load_dotenv()
@@ -42,6 +43,8 @@ class KISBot:
         self.max_positions = 3  # 최대 보유 종목 수
         self.profit_target = 0.05  # 익절 목표 5%
         self.stop_loss = -0.03  # 손절 기준 -3%
+        self.kst_timezone = pytz.timezone('Asia/Seoul')  # 한국 시간대
+        self.last_market_closed_log = 0  # 마지막 장마감 로그 시간
 
         print("KIS Bot 초기화 완료")
         print(f"계좌번호: {self.account_number}")
@@ -80,29 +83,33 @@ class KISBot:
             return None
 
     def get_account_balance(self) -> Dict:
-        """계좌 잔고 조회"""
+        """계좌 잔고 조회 (주식잔고조회 API 사용)"""
         token = self.get_access_token()
         if not token:
             return None
 
-        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         headers = {
             "content-type": "application/json",
             "authorization": f"Bearer {token}",
             "appkey": self.app_key,
             "appsecret": self.app_secret,
-            "tr_id": "VTTC8908R",  # 모의투자 매수 가능 조회
+            "tr_id": "VTTC8434R",  # 모의투자 주식잔고조회
             "custtype": "P"
         }
 
         params = {
             "CANO": self.account_number[:8],
             "ACNT_PRDT_CD": "01",
-            "PDNO": "005930",  # 삼성전자 (필수 파라미터)
-            "ORD_UNPR": "",
-            "ORD_DVSN": "01",
-            "CMA_EVLU_AMT_ICLD_YN": "N",
-            "OVRS_ICLD_YN": "N"
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "N",
+            "INQR_DVSN": "01",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": ""
         }
 
         try:
@@ -111,14 +118,17 @@ class KISBot:
 
             data = response.json()
             if data.get("rt_cd") == "0":
-                output = data.get("output", {})
+                output2 = data.get("output2", [{}])[0]
                 balance = {
-                    "cash": float(output.get("ord_psbl_cash", 0)),
-                    "total_assets": float(output.get("psbl_qty", 0)),
+                    "cash": float(output2.get("dnca_tot_amt", 0)),  # 예수금 총액
+                    "total_assets": float(output2.get("tot_evlu_amt", 0)),  # 총 평가 금액
+                    "stock_value": float(output2.get("scts_evlu_amt", 0)),  # 주식 평가 금액
+                    "profit_loss": float(output2.get("evlu_pfls_amt", 0)),  # 평가 손익 금액
+                    "profit_loss_rate": float(output2.get("evlu_pfls_rt", 0)),  # 평가 손익률
                     "timestamp": datetime.now()
                 }
 
-                print(f"💰 예수금: {balance['cash']:,.0f}원")
+                print(f"💰 예수금: {balance['cash']:,.0f}원 | 총자산: {balance['total_assets']:,.0f}원")
                 return balance
             else:
                 print(f"❌ 잔고 조회 실패: {data.get('msg1')}")
@@ -622,6 +632,18 @@ class KISBot:
         loop_count = 0
         while self.is_running:
             try:
+                # 장 운영 시간 체크
+                if not self.is_trading_time():
+                    current_time = time.time()
+                    # 1시간에 한 번만 로그 출력
+                    if current_time - self.last_market_closed_log > 3600:
+                        now = datetime.now(self.kst_timezone)
+                        print(f"🚫 장 마감: 대기 중... ({now.strftime('%Y-%m-%d %H:%M:%S')} KST)")
+                        self.last_market_closed_log = current_time
+                    time.sleep(60)  # 60초 대기
+                    continue
+
+                # 장 운영 시간 내에만 아래 로직 실행
                 # 10초마다 감시 종목 업데이트 (API 부하 고려)
                 if loop_count % 10 == 0:
                     self.update_watchlist(self.current_watchlist)
@@ -687,6 +709,22 @@ class KISBot:
 
             # 명령 처리 완료 표시
             self.db.collection('commands').document(cmd_doc.id).update({'status': 'completed'})
+
+    def is_trading_time(self) -> bool:
+        """현재 시간이 장 운영 시간인지 확인 (08:00 ~ 18:00)"""
+        now = datetime.now(self.kst_timezone)
+        current_time = now.time()
+        weekday = now.weekday()
+
+        # 주말 체크 (0=월요일, 6=일요일)
+        if weekday >= 5:  # 토요일(5), 일요일(6)
+            return False
+
+        # 장 운영 시간 체크
+        market_start = datetime.strptime("08:00:00", "%H:%M:%S").time()
+        market_end = datetime.strptime("18:00:00", "%H:%M:%S").time()
+
+        return market_start <= current_time <= market_end
 
     def stop(self):
         """봇 정지"""

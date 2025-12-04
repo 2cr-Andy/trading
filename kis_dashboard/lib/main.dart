@@ -13,9 +13,9 @@ void main() async {
   await Firebase.initializeApp(
     options: const FirebaseOptions(
       apiKey: "AIzaSyB8kVnfkCJbqDxKJf_rZxCh8aMnkJrJGhs",
-      authDomain: "tarding.firebaseapp.com",
-      projectId: "tarding",
-      storageBucket: "tarding.appspot.com",
+      authDomain: "trading.firebaseapp.com",
+      projectId: "trading",
+      storageBucket: "trading.appspot.com",
       messagingSenderId: "123456789",
       appId: "1:123456789:web:abc123def456",
     ),
