@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 from market_scanner import MarketScanner
 import pytz
+from slack_notifier import SlackNotifier
 
 # 환경 변수 로드
 load_dotenv()
@@ -45,6 +46,7 @@ class KISBot:
         self.stop_loss = -0.03  # 손절 기준 -3%
         self.kst_timezone = pytz.timezone('Asia/Seoul')  # 한국 시간대
         self.last_market_closed_log = 0  # 마지막 장마감 로그 시간
+        self.slack = SlackNotifier()  # Slack 알림 시스템
 
         print("KIS Bot 초기화 완료")
         print(f"계좌번호: {self.account_number}")
@@ -613,6 +615,9 @@ class KISBot:
 
         print("\n🚀 KIS 자동매매 봇 시작")
         print("=" * 50)
+
+        # Slack 시작 알림
+        self.slack.notify_bot_start()
 
         # 동적 시장 스캔으로 감시 종목 선정
         new_watchlist = self.scan_market_conditions()
