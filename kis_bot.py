@@ -38,6 +38,10 @@ class KISBot:
         # MarketScanner 초기화
         self.scanner = MarketScanner(self.app_key, self.app_secret)
         self.current_watchlist = []
+        self.portfolio = {}  # 보유 종목 관리
+        self.max_positions = 3  # 최대 보유 종목 수
+        self.profit_target = 0.05  # 익절 목표 5%
+        self.stop_loss = -0.03  # 손절 기준 -3%
 
         print("KIS Bot 초기화 완료")
         print(f"계좌번호: {self.account_number}")
@@ -167,6 +171,213 @@ class KISBot:
             print(f"❌ 시세 조회 오류 ({stock_code}): {e}")
             return None
 
+    def buy_stock(self, stock_code: str, current_price: float, buy_reason: str = "") -> bool:
+        """주식 매수 주문 실행 (The Three Kings Rule)"""
+        # 1. 현재 보유 종목 수 확인
+        if len(self.portfolio) >= self.max_positions:
+            print(f"⚠️ 최대 보유 종목({self.max_positions}개) 초과로 매수 불가")
+            return False
+
+        # 2. 예수금 조회
+        balance = self.get_account_balance()
+        if not balance:
+            print("❌ 잘고 조회 실패")
+            return False
+
+        available_cash = balance.get('cash', 0)
+        if available_cash < 10000:  # 최소 매수 금액
+            print(f"⚠️ 예수금 부족: {available_cash:,.0f}원")
+            return False
+
+        # 3. 자금 관리 (3등분 전략)
+        target_buy_amount = available_cash / (self.max_positions - len(self.portfolio))
+        target_buy_amount = min(target_buy_amount, available_cash * 0.33)  # 최대 33% 제한
+        quantity = int(target_buy_amount / current_price)
+
+        if quantity < 1:
+            print(f"⚠️ 매수 수량 부족: {target_buy_amount:,.0f}원 / {current_price:,.0f}원")
+            return False
+
+        # 4. KIS API로 매수 주문 전송
+        token = self.get_access_token()
+        if not token:
+            return False
+
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "VTTC0802U",  # 모의투자 매수
+            "custtype": "P"
+        }
+
+        body = {
+            "CANO": self.account_number[:8],
+            "ACNT_PRDT_CD": "01",
+            "PDNO": stock_code,
+            "ORD_DVSN": "01",  # 시장가
+            "ORD_QTY": str(quantity),
+            "ORD_UNPR": "0",  # 시장가는 0
+            "CTAC_TLNO": "",
+            "SLL_BUY_DVSN_CD": "02",  # 매수
+            "ALGO_NO": ""
+        }
+
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(body))
+            response.raise_for_status()
+
+            data = response.json()
+            if data.get("rt_cd") == "0":
+                # 5. 포트폴리오 추가
+                self.portfolio[stock_code] = {
+                    "buy_price": current_price,
+                    "quantity": quantity,
+                    "buy_time": datetime.now(),
+                    "buy_reason": buy_reason
+                }
+
+                # 6. 거래 로그 기록
+                self.add_trade_log(
+                    "BUY",
+                    f"매수 체결: {quantity}주 @ {current_price:,.0f}원",
+                    stockCode=stock_code,
+                    price=current_price,
+                    quantity=quantity,
+                    reason=buy_reason
+                )
+
+                # 7. 포트폴리오 Firestore 업데이트
+                self.update_portfolio_to_firestore()
+
+                print(f"🟢 매수 성공: {stock_code} {quantity}주 @ {current_price:,.0f}원")
+                print(f"   투자금액: {quantity * current_price:,.0f}원 | 사유: {buy_reason}")
+                return True
+            else:
+                print(f"❌ 매수 주문 실패: {data.get('msg1')}")
+                return False
+
+        except Exception as e:
+            print(f"❌ 매수 주문 오류: {e}")
+            return False
+
+    def sell_stock(self, stock_code: str, current_price: float, sell_reason: str = "") -> bool:
+        """주식 매도 주문 실행"""
+        if stock_code not in self.portfolio:
+            print(f"⚠️ {stock_code} 보유하고 있지 않음")
+            return False
+
+        holding = self.portfolio[stock_code]
+        quantity = holding['quantity']
+
+        # KIS API로 매도 주문 전송
+        token = self.get_access_token()
+        if not token:
+            return False
+
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "VTTC0801U",  # 모의투자 매도
+            "custtype": "P"
+        }
+
+        body = {
+            "CANO": self.account_number[:8],
+            "ACNT_PRDT_CD": "01",
+            "PDNO": stock_code,
+            "ORD_DVSN": "01",  # 시장가
+            "ORD_QTY": str(quantity),
+            "ORD_UNPR": "0",
+            "CTAC_TLNO": "",
+            "SLL_BUY_DVSN_CD": "01",  # 매도
+            "ALGO_NO": ""
+        }
+
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(body))
+            response.raise_for_status()
+
+            data = response.json()
+            if data.get("rt_cd") == "0":
+                # 수익률 계산
+                profit_rate = (current_price - holding['buy_price']) / holding['buy_price']
+                profit_amount = (current_price - holding['buy_price']) * quantity
+
+                # 포트폴리오에서 제거
+                del self.portfolio[stock_code]
+
+                # 거래 로그 기록
+                self.add_trade_log(
+                    "SELL",
+                    f"매도 체결: {quantity}주 @ {current_price:,.0f}원 (수익률: {profit_rate:.2%})",
+                    stockCode=stock_code,
+                    price=current_price,
+                    quantity=quantity,
+                    reason=sell_reason
+                )
+
+                # 포트폴리오 Firestore 업데이트
+                self.update_portfolio_to_firestore()
+
+                emoji = "🔴" if profit_rate > 0 else "🔵"
+                print(f"{emoji} 매도 성공: {stock_code} {quantity}주 @ {current_price:,.0f}원")
+                print(f"   수익: {profit_amount:,.0f}원 ({profit_rate:+.2%}) | 사유: {sell_reason}")
+                return True
+            else:
+                print(f"❌ 매도 주문 실패: {data.get('msg1')}")
+                return False
+
+        except Exception as e:
+            print(f"❌ 매도 주문 오류: {e}")
+            return False
+
+    def check_portfolio_targets(self):
+        """포트폴리오 종목들의 익절/손절 체크"""
+        if not self.portfolio:
+            return
+
+        for stock_code, holding in list(self.portfolio.items()):
+            # 현재가 조회
+            price_data = self.get_stock_price(stock_code)
+            if not price_data:
+                continue
+
+            current_price = price_data['currentPrice']
+            buy_price = holding['buy_price']
+            profit_rate = (current_price - buy_price) / buy_price
+
+            # 익절/손절 체크
+            if profit_rate >= self.profit_target:
+                print(f"\n🎯 익절 신호: {stock_code} 수익률 {profit_rate:.2%}")
+                self.sell_stock(stock_code, current_price, f"익절 {profit_rate:.2%}")
+            elif profit_rate <= self.stop_loss:
+                print(f"\n🚨 손절 신호: {stock_code} 손실률 {profit_rate:.2%}")
+                self.sell_stock(stock_code, current_price, f"손절 {profit_rate:.2%}")
+
+    def update_portfolio_to_firestore(self):
+        """포트폴리오 정보를 Firestore에 업데이트"""
+        for stock_code, holding in self.portfolio.items():
+            self.db.collection('portfolio').document(stock_code).set({
+                "code": stock_code,
+                "buy_price": holding['buy_price'],
+                "quantity": holding['quantity'],
+                "buy_time": holding['buy_time'],
+                "buy_reason": holding.get('buy_reason', ''),
+                "timestamp": firestore.SERVER_TIMESTAMP
+            })
+
+        # 포트폴리오에 없는 종목 삭제
+        portfolio_docs = self.db.collection('portfolio').stream()
+        for doc in portfolio_docs:
+            if doc.id not in self.portfolio:
+                doc.reference.delete()
+
     def get_daily_candles(self, stock_code: str, period: int = 150) -> pd.DataFrame:
         """일봉 데이터 조회 (과거 N일)"""
         token = self.get_access_token()
@@ -259,6 +470,23 @@ class KISBot:
 
         return stock_codes[:5]  # 최대 5개 종목 감시
 
+    def sync_watchlist_with_firestore(self, new_watchlist: List[str]):
+        """감시 종목 리스트를 Firestore와 동기화 (좀비 데이터 삭제)"""
+        # 1. 현재 Firestore에 있는 모든 종목 가져오기
+        existing_docs = self.db.collection('watchlist').stream()
+        existing_codes = set(doc.id for doc in existing_docs)
+
+        # 2. 삭제해야 할 종목 식별 (기존 - 신규)
+        codes_to_delete = existing_codes - set(new_watchlist)
+
+        # 3. 조건에서 탈락한 종목 삭제
+        for code in codes_to_delete:
+            self.db.collection('watchlist').document(code).delete()
+            print(f"🗑️ 감시 종목에서 제거: {code}")
+
+        # 4. 현재 watchlist 업데이트
+        self.current_watchlist = new_watchlist
+
     def update_watchlist(self, watchlist: List[str] = None):
         """감시 종목 리스트 업데이트 (실제 기술적 지표 계산)"""
         if watchlist is None:
@@ -315,6 +543,15 @@ class KISBot:
                 signal_text = f" 🔴 {price_data.get('buyReason', '')}" if price_data.get('nearBuySignal') else ""
                 print(f"📊 {price_data['name']}: {price_data['currentPrice']:,.0f}원 ({price_data['changePercent']:+.2f}%) RSI:{price_data.get('rsi', 0):.1f}{signal_text}")
 
+                # 매수 신호가 있고 포트폴리오에 없다면 매수 실행
+                if price_data.get('nearBuySignal') and stock_code not in self.portfolio:
+                    print(f"\n🔔 매수 신호 감지! {stock_code} 매수 주문 시도...")
+                    self.buy_stock(
+                        stock_code,
+                        price_data['currentPrice'],
+                        price_data.get('buyReason', '')
+                    )
+
             except Exception as e:
                 print(f"❌ {stock_code} 업데이트 오류: {e}")
                 continue
@@ -368,9 +605,12 @@ class KISBot:
         print("=" * 50)
 
         # 동적 시장 스캔으로 감시 종목 선정
-        self.current_watchlist = self.scan_market_conditions()
+        new_watchlist = self.scan_market_conditions()
 
-        if not self.current_watchlist:
+        if new_watchlist:
+            # Firestore 동기화 (조건 탈락 종목 삭제)
+            self.sync_watchlist_with_firestore(new_watchlist)
+        else:
             print("⚠️ 조건에 맞는 종목이 없습니다. 재스캔 예정...")
             self.current_watchlist = []
 
@@ -386,6 +626,10 @@ class KISBot:
                 if loop_count % 10 == 0:
                     self.update_watchlist(self.current_watchlist)
 
+                # 20초마다 포트폴리오 익절/손절 체크
+                if loop_count % 20 == 0 and self.portfolio:
+                    self.check_portfolio_targets()
+
                 # 30초마다 계좌 정보 업데이트
                 if loop_count % 30 == 0:
                     self.update_account_summary()
@@ -395,7 +639,8 @@ class KISBot:
                     print("\n🔄 동적 시장 재스캔...")
                     new_watchlist = self.scan_market_conditions()
                     if new_watchlist:
-                        self.current_watchlist = new_watchlist
+                        # Firestore 동기화 (조건 탈락 종목 삭제)
+                        self.sync_watchlist_with_firestore(new_watchlist)
                         self.add_trade_log("INFO", f"감시 종목 업데이트: {len(new_watchlist)}개")
 
                 # 30초마다 봇 상태 업데이트
@@ -427,11 +672,18 @@ class KISBot:
 
             if cmd_type == 'PANIC_SELL':
                 self.add_trade_log("SELL", "전량 매도 명령 수신")
-                # 실제 매도 로직 구현
+                # 포트폴리오 전체 매도
+                for stock_code in list(self.portfolio.keys()):
+                    price_data = self.get_stock_price(stock_code)
+                    if price_data:
+                        self.sell_stock(stock_code, price_data['currentPrice'], "전량 매도 명령")
             elif cmd_type == 'MANUAL_SELL':
                 stock_code = cmd_data.get('stockCode')
                 self.add_trade_log("SELL", f"수동 매도 명령 수신: {stock_code}")
-                # 실제 매도 로직 구현
+                if stock_code in self.portfolio:
+                    price_data = self.get_stock_price(stock_code)
+                    if price_data:
+                        self.sell_stock(stock_code, price_data['currentPrice'], "수동 매도 명령")
 
             # 명령 처리 완료 표시
             self.db.collection('commands').document(cmd_doc.id).update({'status': 'completed'})
