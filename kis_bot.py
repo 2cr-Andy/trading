@@ -2,11 +2,14 @@ import os
 import json
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
+import pandas as pd
+import numpy as np
+from market_scanner import MarketScanner
 
 # 환경 변수 로드
 load_dotenv()
@@ -32,9 +35,13 @@ class KISBot:
         # 봇 상태
         self.is_running = False
 
+        # MarketScanner 초기화
+        self.scanner = MarketScanner(self.app_key, self.app_secret)
+        self.current_watchlist = []
+
         print("KIS Bot 초기화 완료")
         print(f"계좌번호: {self.account_number}")
-        print(f"Firebase 프로젝트: {os.getenv('FIREBASE_PROJECT_NAME')}")
+        print(f"Firebase 프로젝트: trading")
 
     def get_access_token(self) -> str:
         """접속 토큰 발급 또는 갱신"""
@@ -160,23 +167,157 @@ class KISBot:
             print(f"❌ 시세 조회 오류 ({stock_code}): {e}")
             return None
 
-    def update_watchlist(self):
-        """감시 종목 리스트 업데이트"""
-        # 예시 종목들 (실제로는 조건검색 API 사용)
-        watchlist = ["005930", "000660", "035720", "051910", "035420"]  # 삼성전자, SK하이닉스, 카카오, LG화학, NAVER
+    def get_daily_candles(self, stock_code: str, period: int = 150) -> pd.DataFrame:
+        """일봉 데이터 조회 (과거 N일)"""
+        token = self.get_access_token()
+        if not token:
+            return None
+
+        # 날짜 계산
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.now() - timedelta(days=period)).strftime('%Y%m%d')
+
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "FHKST03010100"
+        }
+
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start_date,
+            "FID_INPUT_DATE_2": end_date,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0"
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            if data.get("rt_cd") == "0":
+                output2 = data.get("output2", [])
+                if not output2:
+                    return None
+
+                # DataFrame 생성
+                df_data = []
+                for row in output2:
+                    df_data.append({
+                        "date": pd.to_datetime(row.get("stck_bsop_date", "")),
+                        "open": float(row.get("stck_oprc", 0)),
+                        "high": float(row.get("stck_hgpr", 0)),
+                        "low": float(row.get("stck_lwpr", 0)),
+                        "close": float(row.get("stck_clpr", 0)),
+                        "volume": float(row.get("acml_vol", 0)),
+                        "amount": float(row.get("acml_tr_pbmn", 0))
+                    })
+
+                df = pd.DataFrame(df_data)
+                df.sort_values('date', inplace=True)
+                df.reset_index(drop=True, inplace=True)
+                return df
+
+            return None
+
+        except Exception as e:
+            print(f"❌ 일봉 데이터 조회 오류 ({stock_code}): {e}")
+            return None
+
+    def calculate_technicals(self, df: pd.DataFrame) -> Dict:
+        """기술적 지표 계산 (MarketScanner의 고급 지표 활용)"""
+        if df is None or len(df) < 120:
+            return None
+
+        # MarketScanner의 고급 지표 계산 메서드 활용
+        return self.scanner.calculate_advanced_technicals(df)
+
+    def scan_market_conditions(self) -> List[str]:
+        """동적 시장 스캔 - MarketScanner 활용"""
+        print("\n🚀 동적 시장 스캔 시작 (거래량/등락률/수급 분석)")
+
+        # MarketScanner로 주도주 발굴
+        qualified_stocks = self.scanner.scan_market()
+
+        if not qualified_stocks:
+            print("⚠️ 조건에 맞는 종목이 없습니다.")
+            return []
+
+        # 종목 코드만 추출
+        stock_codes = [stock['code'] for stock in qualified_stocks]
+
+        # 선정된 종목 정보 출력
+        print(f"\n✨ 최종 선정 종목: {len(stock_codes)}개")
+        for stock in qualified_stocks[:5]:  # 상위 5개만 표시
+            signal_text = f"🔴 매수신호: {stock['buy_reason']}" if stock['buy_signal'] else "⚪ 대기"
+            print(f"  📌 {stock['code']}: {stock['price']:,.0f}원 | RSI:{stock['rsi']:.1f} | ADX:{stock['adx']:.1f} | {signal_text}")
+
+        return stock_codes[:5]  # 최대 5개 종목 감시
+
+    def update_watchlist(self, watchlist: List[str] = None):
+        """감시 종목 리스트 업데이트 (실제 기술적 지표 계산)"""
+        if watchlist is None:
+            watchlist = self.current_watchlist if hasattr(self, 'current_watchlist') else []
+
+        if not watchlist:
+            print("⚠️ 감시 종목이 없습니다")
+            return
 
         for stock_code in watchlist:
-            price_data = self.get_stock_price(stock_code)
-            if price_data:
-                # RSI, MFI는 실제로는 일봉 데이터로 계산해야 함
-                price_data["rsi"] = 45 + (float(stock_code[-2:]) % 30)  # 임시 값
-                price_data["mfi"] = 40 + (float(stock_code[-2:]) % 40)  # 임시 값
-                price_data["volumeChange"] = 100 + (float(stock_code[-2:]) % 500)  # 임시 값
-                price_data["nearBuySignal"] = price_data["rsi"] < 35
+            try:
+                # 현재가 조회
+                price_data = self.get_stock_price(stock_code)
+                if not price_data:
+                    continue
+
+                # 일봉 데이터와 고급 지표 계산
+                df = self.scanner.get_daily_candles(stock_code)
+                if df is not None and len(df) >= 120:
+                    # MarketScanner의 고급 지표 계산
+                    indicators = self.scanner.calculate_advanced_technicals(df)
+                    if indicators:
+                        # 수급 데이터 추가
+                        smart_money = self.scanner.get_foreign_institution_buy(stock_code)
+
+                        # 매수 신호 확인
+                        buy_signal, buy_reason = self.scanner.check_buy_signal(indicators)
+
+                        price_data["rsi"] = indicators['rsi']
+                        price_data["mfi"] = indicators['mfi']
+                        price_data["volumeChange"] = 0  # 별도 계산 필요
+                        price_data["ma120"] = indicators['ma120']
+                        price_data["ma20"] = indicators['ma20']
+                        price_data["bb_upper"] = indicators['bb_upper']
+                        price_data["bb_lower"] = indicators['bb_lower']
+                        price_data["adx"] = indicators['adx']
+                        price_data["obv_signal"] = indicators['obv'] > indicators['obv_ma20']
+                        price_data["nearBuySignal"] = buy_signal
+                        price_data["buyReason"] = buy_reason
+
+                        if smart_money:
+                            price_data["foreignNetBuy"] = smart_money.get('foreign_net_buy_5d', 0)
+                            price_data["institutionNetBuy"] = smart_money.get('institution_net_buy_5d', 0)
+                else:
+                    # 데이터 부족 시 기본값
+                    price_data["rsi"] = 50
+                    price_data["mfi"] = 50
+                    price_data["volumeChange"] = 0
+                    price_data["nearBuySignal"] = False
+                    price_data["buyReason"] = ""
 
                 # Firestore에 저장
                 self.db.collection('watchlist').document(stock_code).set(price_data)
-                print(f"📊 {price_data['name']} 업데이트: {price_data['currentPrice']:,.0f}원 ({price_data['changePercent']:+.2f}%)")
+                signal_text = f" 🔴 {price_data.get('buyReason', '')}" if price_data.get('nearBuySignal') else ""
+                print(f"📊 {price_data['name']}: {price_data['currentPrice']:,.0f}원 ({price_data['changePercent']:+.2f}%) RSI:{price_data.get('rsi', 0):.1f}{signal_text}")
+
+            except Exception as e:
+                print(f"❌ {stock_code} 업데이트 오류: {e}")
+                continue
 
     def update_account_summary(self):
         """계좌 정보 업데이트"""
@@ -221,26 +362,41 @@ class KISBot:
         """봇 시작"""
         self.is_running = True
         self.update_bot_status()
-        self.add_trade_log("INFO", "KIS 자동매매 봇 시작 (모의투자)")
+        self.add_trade_log("INFO", "KIS 자동매매 봇 시작 (실제 데이터 기반)")
 
         print("\n🚀 KIS 자동매매 봇 시작")
         print("=" * 50)
 
+        # 동적 시장 스캔으로 감시 종목 선정
+        self.current_watchlist = self.scan_market_conditions()
+
+        if not self.current_watchlist:
+            print("⚠️ 조건에 맞는 종목이 없습니다. 재스캔 예정...")
+            self.current_watchlist = []
+
         # 초기 데이터 업데이트
         self.update_account_summary()
-        self.update_watchlist()
+        self.update_watchlist(self.current_watchlist)
 
         # 메인 루프
         loop_count = 0
         while self.is_running:
             try:
-                # 5초마다 감시 종목 업데이트
-                if loop_count % 5 == 0:
-                    self.update_watchlist()
-
-                # 10초마다 계좌 정보 업데이트
+                # 10초마다 감시 종목 업데이트 (API 부하 고려)
                 if loop_count % 10 == 0:
+                    self.update_watchlist(self.current_watchlist)
+
+                # 30초마다 계좌 정보 업데이트
+                if loop_count % 30 == 0:
                     self.update_account_summary()
+
+                # 300초(5분)마다 시장 조건 재스캔
+                if loop_count % 300 == 0 and loop_count > 0:
+                    print("\n🔄 동적 시장 재스캔...")
+                    new_watchlist = self.scan_market_conditions()
+                    if new_watchlist:
+                        self.current_watchlist = new_watchlist
+                        self.add_trade_log("INFO", f"감시 종목 업데이트: {len(new_watchlist)}개")
 
                 # 30초마다 봇 상태 업데이트
                 if loop_count % 30 == 0:
