@@ -1,0 +1,7 @@
+requests
+websocket-client
+pandas
+numpy
+firebase-admin
+python-dotenv
+schedule
