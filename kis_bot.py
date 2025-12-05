@@ -33,6 +33,7 @@ class KISBot:
         self.base_url = "https://openapivts.koreainvestment.com:29443"
         self.access_token = None
         self.token_expires_at = 0
+        self.last_token_attempt = 0  # 마지막 토큰 발급 시도 시간
 
         # 봇 상태
         self.is_running = False
@@ -60,6 +61,13 @@ class KISBot:
         if self.access_token and current_time < self.token_expires_at:
             return self.access_token
 
+        # 1분 제한 체크 (마지막 시도로부터 60초 경과 확인)
+        time_since_last_attempt = current_time - self.last_token_attempt
+        if time_since_last_attempt < 60:
+            wait_time = 60 - time_since_last_attempt
+            print(f"⏳ 토큰 발급 제한: {wait_time:.0f}초 후 재시도 가능")
+            return None
+
         url = f"{self.base_url}/oauth2/tokenP"
         headers = {"content-type": "application/json"}
         body = {
@@ -68,8 +76,26 @@ class KISBot:
             "appsecret": self.app_secret
         }
 
+        print(f"🔑 토큰 발급 시도: {url}")
+        print(f"   APP_KEY: {self.app_key[:10]}...")
+
+        # 토큰 시도 시간 기록
+        self.last_token_attempt = current_time
+
         try:
             response = requests.post(url, headers=headers, data=json.dumps(body))
+
+            if response.status_code == 403:
+                error_data = response.json() if response.text else {}
+                error_code = error_data.get("error_code", "")
+
+                print(f"❌ 403 에러 상세:")
+                print(f"   Response: {response.text}")
+
+                if error_code == "EGW00133":  # 1분 제한 에러
+                    print(f"⏳ 1분 후 재시도해주세요")
+                    return None
+
             response.raise_for_status()
 
             token_data = response.json()
@@ -82,6 +108,9 @@ class KISBot:
 
         except Exception as e:
             print(f"❌ 토큰 발급 실패: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"   Status Code: {e.response.status_code}")
+                print(f"   Response: {e.response.text}")
             return None
 
     def get_account_balance(self) -> Dict:
@@ -573,13 +602,15 @@ class KISBot:
         balance = self.get_account_balance()
         if balance:
             # 계좌 요약 정보 저장
-            self.db.collection('account').document('summary').set({
+            account_data = {
                 "totalAssets": balance.get("total_assets", 0),
                 "totalCash": balance.get("cash", 0),
-                "todayPnL": 0,  # 실제로는 당일 손익 계산 필요
-                "todayPnLPercent": 0,
+                "todayPnL": balance.get("profit_loss", 0),  # 평가 손익
+                "todayPnLPercent": balance.get("profit_loss_rate", 0),  # 평가 손익률
                 "timestamp": firestore.SERVER_TIMESTAMP
-            })
+            }
+            print(f"📊 Firebase 계좌 업데이트: 총자산={account_data['totalAssets']:,.0f}원, 예수금={account_data['totalCash']:,.0f}원")
+            self.db.collection('account').document('summary').set(account_data)
 
     def update_bot_status(self):
         """봇 상태 업데이트 (Heartbeat)"""
