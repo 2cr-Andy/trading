@@ -12,6 +12,7 @@ import numpy as np
 from market_scanner import MarketScanner
 import pytz
 from slack_notifier import SlackNotifier
+from logger_system import UnifiedLogger
 
 # 환경 변수 로드
 load_dotenv()
@@ -38,8 +39,8 @@ class KISBot:
         # 봇 상태
         self.is_running = False
 
-        # MarketScanner 초기화
-        self.scanner = MarketScanner(self.app_key, self.app_secret)
+        # MarketScanner 초기화 (토큰 공유를 위해 self.get_access_token 전달)
+        self.scanner = MarketScanner(self.app_key, self.app_secret, self.get_access_token)
         self.current_watchlist = []
         self.portfolio = {}  # 보유 종목 관리
         self.max_positions = 3  # 최대 보유 종목 수
@@ -49,9 +50,14 @@ class KISBot:
         self.last_market_closed_log = 0  # 마지막 장마감 로그 시간
         self.slack = SlackNotifier()  # Slack 알림 시스템
 
-        print("KIS Bot 초기화 완료")
-        print(f"계좌번호: {self.account_number}")
-        print(f"Firebase 프로젝트: trading")
+        # 통합 로거 초기화
+        self.logger = UnifiedLogger(log_dir="logs", slack_enabled=True)
+
+        self.logger.system("KIS Bot 초기화 완료", {
+            "계좌번호": self.account_number,
+            "Firebase 프로젝트": "trading-dcd8c",
+            "최대 보유 종목": self.max_positions
+        })
 
     def get_access_token(self) -> str:
         """접속 토큰 발급 또는 갱신"""
@@ -65,7 +71,7 @@ class KISBot:
         time_since_last_attempt = current_time - self.last_token_attempt
         if time_since_last_attempt < 60:
             wait_time = 60 - time_since_last_attempt
-            print(f"⏳ 토큰 발급 제한: {wait_time:.0f}초 후 재시도 가능")
+            self.logger.warning(f"토큰 발급 제한: {wait_time:.0f}초 후 재시도 가능")
             return None
 
         url = f"{self.base_url}/oauth2/tokenP"
@@ -76,8 +82,7 @@ class KISBot:
             "appsecret": self.app_secret
         }
 
-        print(f"🔑 토큰 발급 시도: {url}")
-        print(f"   APP_KEY: {self.app_key[:10]}...")
+        self.logger.debug(f"토큰 발급 시도", {"url": url, "app_key_prefix": self.app_key[:10]})
 
         # 토큰 시도 시간 기록
         self.last_token_attempt = current_time
@@ -89,11 +94,10 @@ class KISBot:
                 error_data = response.json() if response.text else {}
                 error_code = error_data.get("error_code", "")
 
-                print(f"❌ 403 에러 상세:")
-                print(f"   Response: {response.text}")
+                self.logger.error(f"403 에러 발생", {"response": response.text, "error_code": error_code})
 
                 if error_code == "EGW00133":  # 1분 제한 에러
-                    print(f"⏳ 1분 후 재시도해주세요")
+                    self.logger.warning("토큰 발급 1분 제한 - 1분 후 재시도 필요")
                     return None
 
             response.raise_for_status()
@@ -103,14 +107,15 @@ class KISBot:
             # 토큰 만료 시간 설정 (보통 24시간이지만 안전하게 23시간으로 설정)
             self.token_expires_at = current_time + (23 * 60 * 60)
 
-            print("✅ 접속 토큰 발급 성공")
+            self.logger.success("접속 토큰 발급 성공")
             return self.access_token
 
         except Exception as e:
-            print(f"❌ 토큰 발급 실패: {e}")
+            error_data = {"error": str(e)}
             if hasattr(e, 'response') and e.response is not None:
-                print(f"   Status Code: {e.response.status_code}")
-                print(f"   Response: {e.response.text}")
+                error_data["status_code"] = e.response.status_code
+                error_data["response"] = e.response.text
+            self.logger.error("토큰 발급 실패", error_data)
             return None
 
     def get_account_balance(self) -> Dict:

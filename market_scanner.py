@@ -16,20 +16,34 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class MarketScanner:
-    def __init__(self, app_key: str, app_secret: str):
+    def __init__(self, app_key: str, app_secret: str, token_provider=None):
         """시장 스캐너 초기화"""
         self.app_key = app_key
         self.app_secret = app_secret
         self.base_url = "https://openapivts.koreainvestment.com:29443"
+        self.token_provider = token_provider  # 외부 토큰 제공자
         self.access_token = None
         self.token_expires_at = 0
+        self.last_token_attempt = 0
 
     def get_access_token(self) -> str:
-        """접속 토큰 발급"""
+        """접속 토큰 발급 (외부 token_provider 사용 우선)"""
+        # 외부 토큰 제공자가 있으면 사용
+        if self.token_provider:
+            return self.token_provider()
+
+        # 외부 토큰 제공자가 없으면 자체 토큰 관리
         current_time = time.time()
 
         if self.access_token and current_time < self.token_expires_at:
             return self.access_token
+
+        # 1분 제한 체크 (마지막 시도로부터 60초 경과 확인)
+        time_since_last_attempt = current_time - self.last_token_attempt
+        if time_since_last_attempt < 60:
+            wait_time = 60 - time_since_last_attempt
+            print(f"⏳ MarketScanner 토큰 발급 제한: {wait_time:.0f}초 후 재시도 가능")
+            return None
 
         url = f"{self.base_url}/oauth2/tokenP"
         headers = {"content-type": "application/json"}
@@ -38,6 +52,9 @@ class MarketScanner:
             "appkey": self.app_key,
             "appsecret": self.app_secret
         }
+
+        # 토큰 시도 시간 기록
+        self.last_token_attempt = current_time
 
         try:
             response = requests.post(url, headers=headers, data=json.dumps(body))
@@ -74,12 +91,12 @@ class MarketScanner:
             "FID_INPUT_ISCD": "0000",
             "FID_DIV_CLS_CODE": "0",
             "FID_BLNG_CLS_CODE": "0",
-            "FID_TRGT_CLS_CODE": "111111111",
-            "FID_TRGT_EXLS_CLS_CODE": "000000",
+            "FID_TRGT_CLS_CODE": "",         # 빈 문자열로 변경
+            "FID_TRGT_EXLS_CLS_CODE": "",    # 빈 문자열로 변경
             "FID_INPUT_PRICE_1": "",
             "FID_INPUT_PRICE_2": "",
             "FID_VOL_CNT": "",
-            "FID_INPUT_DATE_1": ""
+            "FID_INPUT_DATE_1": ""           # 날짜 필드 추가
         }
 
         try:
@@ -87,16 +104,26 @@ class MarketScanner:
             response.raise_for_status()
 
             data = response.json()
-            if data.get("rt_cd") == "0":
+            print(f"🔍 거래량 조회 응답: rt_cd={data.get('rt_cd')}, msg_cd={data.get('msg_cd')}, msg1={data.get('msg1')}")
+
+            # rt_cd가 "0" 또는 빈 문자열인 경우 모두 처리
+            if data.get("rt_cd") in ["0", ""]:
                 output = data.get("output", [])
+                print(f"📋 응답 데이터 개수: {len(output)}")
+                if len(output) == 0:
+                    print(f"⚠️ 빈 응답 - 전체 응답: {data}")
+
                 stock_codes = []
                 for item in output[:30]:  # 상위 30개
-                    code = item.get("stck_shrn_iscd")
+                    # 거래량 API는 mksc_shrn_iscd 필드 사용
+                    code = item.get("mksc_shrn_iscd")
                     if code and len(code) == 6:
                         stock_codes.append(code)
 
                 print(f"📊 거래량 상위 {len(stock_codes)}개 종목 발견")
                 return stock_codes
+            else:
+                print(f"❌ API 에러 응답: {data}")
 
         except Exception as e:
             print(f"❌ 거래량 순위 조회 실패: {e}")
@@ -181,17 +208,29 @@ class MarketScanner:
             response.raise_for_status()
 
             data = response.json()
-            if data.get("rt_cd") == "0":
-                output = data.get("output", {})
+            if data.get("rt_cd") in ["0", ""]:  # 빈 문자열도 처리
+                output = data.get("output", [])
 
-                # 5일 누적 매매 (외국인 + 기관 합산)
-                foreign_net_buy = 0
-                institution_net_buy = 0
+                # API 응답이 리스트인 경우 (일별 데이터)
+                if isinstance(output, list) and len(output) > 0:
+                    foreign_net_buy = 0
+                    institution_net_buy = 0
 
-                # 개인: prsn, 외국인: frgn, 기관: orgn
-                for i in range(1, 6):  # 최근 5일
-                    foreign_net_buy += float(output.get(f"frgn_ntby_qty", 0))
-                    institution_net_buy += float(output.get(f"orgn_ntby_qty", 0))
+                    # 최근 5일간 데이터 합산 (최대 5개)
+                    for item in output[:5]:
+                        # 각 일자별 외국인/기관 순매수량
+                        foreign_net_buy += float(item.get("frgn_ntby_qty", 0))
+                        institution_net_buy += float(item.get("orgn_ntby_qty", 0))
+
+                # API 응답이 딕셔너리인 경우 (단일 데이터)
+                elif isinstance(output, dict):
+                    # 당일 데이터만 사용
+                    foreign_net_buy = float(output.get("frgn_ntby_qty", 0))
+                    institution_net_buy = float(output.get("orgn_ntby_qty", 0))
+                else:
+                    # 데이터가 없는 경우 기본값 반환
+                    foreign_net_buy = 0
+                    institution_net_buy = 0
 
                 return {
                     "foreign_net_buy_5d": foreign_net_buy,
@@ -211,7 +250,7 @@ class MarketScanner:
             return None
 
         end_date = datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.now() - timedelta(days=period)).strftime('%Y%m%d')
+        start_date = (datetime.now() - timedelta(days=150)).strftime('%Y%m%d')
 
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         headers = {
@@ -269,6 +308,7 @@ class MarketScanner:
             return None
 
         # 기본 이동평균선
+        df['MA5'] = df['close'].rolling(window=5).mean()  # 5일 이평선 추가
         df['MA20'] = df['close'].rolling(window=20).mean()
         df['MA60'] = df['close'].rolling(window=60).mean()
         df['MA120'] = df['close'].rolling(window=120).mean()
@@ -329,6 +369,7 @@ class MarketScanner:
 
         return {
             "current_price": latest['close'],
+            "ma5": latest['MA5'],  # 5일 이평선 추가
             "ma20": latest['MA20'],
             "ma60": latest['MA60'],
             "ma120": latest['MA120'],
@@ -345,55 +386,88 @@ class MarketScanner:
             "prev_stoch_slow_d": prev['stoch_slow_d'],
             "prev_close": prev['close'],
             "prev_low": prev['low'],
+            "prev_ma5": prev['MA5'] if len(df) > 1 else latest['MA5'],  # 전일 5일 이평선
             "bb_position": (latest['close'] - latest['BB_lower']) / (latest['BB_upper'] - latest['BB_lower'])
         }
 
     def check_universe_filter(self, indicators: Dict, smart_money: Dict) -> bool:
-        """종목 필터링 조건 확인 (4가지 조건 모두 만족)"""
+        """종목 필터링 조건 확인 - 눌림목 매매 전략 (추세는 필수 + 나머지 1개)"""
         if not indicators or not smart_money:
             return False
 
-        # 1. Trend Strength (추세 강도)
-        trend_ok = (indicators['adx'] > 25 and
-                   indicators['current_price'] > indicators['ma60'] and
-                   indicators['current_price'] > indicators['ma120'])
+        # 1. Trend Strength (추세 강도) - 필수 조건, 완화됨
+        # ADX 20 이상이고, 20일선 또는 60일선 위에 있으면 OK
+        trend_ok = (indicators['adx'] > 20 and
+                   (indicators['current_price'] > indicators['ma20'] or
+                    indicators['current_price'] > indicators['ma60']))
 
-        # 2. Smart Money (수급)
-        smart_money_ok = smart_money.get('smart_money_net_buy_5d', 0) > 0
+        # 추세 조건이 없으면 즉시 False 반환
+        if not trend_ok:
+            return False
+
+        # 나머지 조건들 체크 (최소 1개 이상 만족 필요)
+        other_conditions = 0
+
+        # 2. Smart Money (수급) - 완화됨
+        # 외국인이나 기관 중 하나라도 순매수면 OK
+        foreign_buy = smart_money.get('foreign_net_buy_5d', 0)
+        institution_buy = smart_money.get('institution_net_buy_5d', 0)
+        smart_money_ok = (foreign_buy > 0 or institution_buy > 0 or
+                         (foreign_buy + institution_buy) > 0)
+        if smart_money_ok:
+            other_conditions += 1
 
         # 3. Accumulation (매집)
         accumulation_ok = indicators['obv'] > indicators['obv_ma20']
+        if accumulation_ok:
+            other_conditions += 1
 
-        # 4. Fundamentals (시가총액은 별도 체크 필요)
-        # 여기서는 가격 필터로 대체 (5,000원 이상)
-        fundamentals_ok = indicators['current_price'] >= 5000
+        # 4. Fundamentals (가격 필터 - 500원으로 완화)
+        fundamentals_ok = indicators['current_price'] >= 500
+        if fundamentals_ok:
+            other_conditions += 1
 
-        return trend_ok and smart_money_ok and accumulation_ok and fundamentals_ok
+        # 추세 조건 만족 + 나머지 중 최소 1개 만족
+        return other_conditions >= 1
 
     def check_buy_signal(self, indicators: Dict) -> Tuple[bool, str]:
-        """매수 신호 확인 (하나라도 만족)"""
+        """매수 신호 확인 - 눌림목 매매 (반등의 기미 포착)"""
         if not indicators:
             return False, ""
 
         reasons = []
 
-        # 1. MFI Divergence
-        if indicators['mfi'] < 20:
-            reasons.append("MFI 과매도")
+        # 1. MFI 과매도 - 기준 완화 (20 → 30)
+        if indicators['mfi'] < 30:
+            reasons.append("MFI 과매도 (<30)")
 
-        # 2. Stochastic Golden Cross
+        # 2. RSI 과매도 신호 추가
+        if indicators['rsi'] < 35:
+            reasons.append("RSI 과매도 (<35)")
+
+        # 3. Stochastic Golden Cross - 범위 확대 (20 → 40)
         if (indicators['prev_stoch_slow_k'] <= indicators['prev_stoch_slow_d'] and
             indicators['stoch_slow_k'] > indicators['stoch_slow_d']):
-            if indicators['stoch_slow_k'] < 20:
-                reasons.append("스토캐스틱 골든크로스(과매도권)")
+            if indicators['stoch_slow_k'] < 40:  # 20 → 40으로 완화
+                reasons.append("스토캐스틱 골든크로스(눌림목)")
             else:
                 reasons.append("스토캐스틱 골든크로스")
 
-        # 3. BB Re-entry (볼린저밴드 재진입)
+        # 4. BB Re-entry (볼린저밴드 재진입)
         if (indicators['prev_close'] < indicators['bb_lower'] and
             indicators['current_price'] > indicators['bb_lower'] and
             indicators['current_price'] > indicators['prev_close']):
             reasons.append("볼린저밴드 하단 반등")
+
+        # 5. 5일 이평선 돌파 신호 추가 (중요!)
+        if (indicators.get('prev_close', 0) < indicators.get('prev_ma5', 0) and
+            indicators['current_price'] > indicators.get('ma5', 0)):
+            reasons.append("5일선 돌파 (단기 반등)")
+
+        # 6. 5일선 지지 확인 (추가 신호)
+        if (abs(indicators['current_price'] - indicators.get('ma5', 0)) / indicators['current_price'] < 0.01 and
+            indicators['current_price'] > indicators.get('prev_close', 0)):
+            reasons.append("5일선 지지 후 상승")
 
         return len(reasons) > 0, ", ".join(reasons)
 

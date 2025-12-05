@@ -12,12 +12,13 @@ void main() async {
   // Firebase 초기화 - 웹용 설정
   await Firebase.initializeApp(
     options: const FirebaseOptions(
-      apiKey: "AIzaSyB8kVnfkCJbqDxKJf_rZxCh8aMnkJrJGhs",
-      authDomain: "trading.firebaseapp.com",
-      projectId: "trading",
-      storageBucket: "trading.appspot.com",
-      messagingSenderId: "123456789",
-      appId: "1:123456789:web:abc123def456",
+      apiKey: "AIzaSyClAZBTkO_duopOI7GOZ-g33gs9g5kj-Do",
+      authDomain: "trading-dcd8c.firebaseapp.com",
+      projectId: "trading-dcd8c",
+      storageBucket: "trading-dcd8c.firebasestorage.app",
+      messagingSenderId: "983762880358",
+      appId: "1:983762880358:web:3ab227730cc10e8cf86aa7",
+      measurementId: "G-EFP3EHBF2W",
     ),
   );
 
