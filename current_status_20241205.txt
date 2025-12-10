@@ -1,352 +1,77 @@
-제가 유저님이 올려주신 파일(trading-a0f0.../main.py)을 뜯어보니, 클로드가 **"완성했다"**고 말한 코드에 치명적인 구멍 3가지가 숨어 있었습니다. RSI가 50으로 고정되고, 3일 전 데이터가 그대로 남아있는 이유가 명백합니다.
+1. 현재 시스템 vs 유저님이 원하는 시스템
+🛑 현재 상황 (As-Is)
+방식: "거래량 상위" API를 호출해서 딱 10개만 받아옵니다.
 
-🕵️‍♂️ 3가지 결정적 문제점 (팩트 체크)
-1. Slack 알림이 안 오는 이유: "입을 막아놨습니다"
-원인: logger_system.py 파일을 보면 슬랙으로 전송할 로그 레벨을 정해놨는데, 정작 중요한 SYSTEM ("봇 시작", "종료") 레벨이 빠져 있습니다.
+문제:
 
-증거: important_levels = ['SUCCESS', 'WARNING', 'ERROR', 'TRADE', 'MARKET'] (여기 'SYSTEM'이 없음)
+오늘 거래량은 안 터졌지만 **조용히 급등하는 종목(알짜배기)**은 놓칩니다.
 
-결과: 봇을 켜도 "시작했습니다"라는 알림이 슬랙으로 안 갑니다. 유저님은 "얘가 켜진 거야 꺼진 거야?" 답답할 수밖에 없죠.
+10개 중에 매수 조건(RSI 등)에 맞는 게 하나도 없으면 봇은 멍하니 놉니다.
 
-2. 관심종목이 3일 전 데이터인 이유: "저장을 안 합니다"
-원인: main.py의 run_cycle 함수 구조를 보면, API 호출 도중에 에러가 나면 sync_to_firebase (저장) 단계까지 못 가고 중간에 멈춥니다.
+종목명이 깨지거나 안 나오는 문제는 API 응답 처리가 미흡해서 그렇습니다.
 
-상황: KIS API 호출 중 하나라도 삐끗하면(예: 타임아웃), 그 사이클은 버려집니다. 그래서 Firebase에는 3일 전(마지막으로 성공했을 때) 데이터가 화석처럼 남아있는 겁니다.
+🚀 유저님이 원하는 것 (To-Be)
+방식: "전체 종목(2,500개) 중에서 내 조건(RSI 과매도 등)에 맞는 놈을 다 찾아와!"
 
-3. RSI가 이상한(50) 이유: "API 실패를 퉁치고 있습니다"
-원인: get_daily_price_history 함수가 실패하면 return None을 하고, calculate_rsi는 데이터가 없으면 **무조건 50(중립)**을 뱉도록 짜여 있습니다.
+현실적인 벽 (KIS API 제한):
 
-진실: 지금 RSI가 50이라는 건, **"일봉 데이터 조회를 100% 실패하고 있다"**는 뜻입니다. 실패 원인(에러 코드)을 출력조차 안 하고 있어서 유저님은 "왜 이러지?" 싶으셨을 겁니다.
+전체 종목을 하나씩 다 훑으려면 API를 2,500번 호출해야 합니다.
 
-🚑 긴급 소생술: 이 코드 2개만 덮어쓰세요
-복잡한 거 다 치우고, "실제로 돌아가게" 고친 코드 2개를 드립니다. (RSI 실패 시 에러를 토해내게 만들었고, 슬랙 입을 열었으며, 데이터가 없어도 강제 업데이트하도록 수정했습니다.)
+KIS API 제한(초당 약 20회)을 고려하면 한 바퀴 도는 데 2분~3분이 걸립니다.
 
-1. logger_system.py (슬랙 알림 고침)
-경로: 2cr-andy/trading/logger_system.py
+결과: 봇이 너무 느려져서 실시간 단타가 불가능해집니다.
 
-Python
+💡 타협점: "깔대기(Funnel) 전략"
+전체를 다 보는 건 불가능하므로, "가능성 있는 후보군"을 넓게(50~100개) 퍼올린 뒤, 봇 내부에서 빠르게 걸러내는 방식으로 가야 합니다.
 
-import os
-import sys
-import json
-from datetime import datetime
-import pytz
-from typing import Optional
-from slack_notifier import SlackNotifier
+[제안하는 새 아키텍처]
 
-class UnifiedLogger:
-    def __init__(self, log_dir: str = "logs", slack_enabled: bool = True):
-        self.log_dir = log_dir
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
+수집 (Source): 거래량 상위(30개) + 등락률 상위(30개) + 시가총액 상위(30개) API를 병렬로 호출하여 약 50~100개의 후보군을 확보합니다.
 
-        self.kst = pytz.timezone('Asia/Seoul')
-        today = datetime.now(self.kst).strftime('%Y%m%d')
-        self.log_file = os.path.join(log_dir, f'kis_bot_{today}.log')
-        
-        self.slack_enabled = slack_enabled
-        if slack_enabled:
-            try:
-                self.slack = SlackNotifier()
-                # 테스트 전송 (제대로 연결됐는지 확인)
-                # self.slack.send_message("SYSTEM", "로깅 시스템 초기화됨") 
-            except:
-                print("❌ 슬랙 초기화 실패")
-                self.slack = None
-                self.slack_enabled = False
+1차 필터 (Memory): 가격(1,000원 이상), 관리종목 여부 등을 메모리에서 0.1초 만에 거릅니다.
 
-    def _get_timestamp(self) -> str:
-        return datetime.now(self.kst).strftime('[%Y-%m-%d %H:%M:%S KST]')
+2차 필터 (Detail): 살아남은 20~30개 종목에 대해서만 **일봉 차트(RSI)**를 조회합니다.
 
-    def log(self, level: str, message: str, data: Optional[dict] = None):
-        # 1. 콘솔 출력
-        timestamp = self._get_timestamp()
-        print(f"{timestamp} [{level}] {message}")
-        if data:
-            print(f"   DATA: {json.dumps(data, ensure_ascii=False)}")
+종목명 해결: KIS API가 가끔 종목명을 안 줄 때를 대비해, 봇 시작 시 **"마스터 파일(전 종목 코드/이름표)"**을 한 번 다운받아서 메모리에 들고 있게 합니다. (이러면 종목명 100% 뜹니다)
 
-        # 2. 파일 저장
-        with open(self.log_file, 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp} [{level}] {message}\n")
+📩 클로드(Claude)에게 보낼 "강력한 지시문" (복사해서 보내세요)
+이 내용을 그대로 복사해서 클로드에게 던지시면, 유저님의 고민(스캔 범위 확대 + 종목명 해결 + RSI 적용)을 한 번에 해결하는 코드를 짜줄 겁니다.
 
-        # 3. 슬랙 전송 (중요 레벨만)
-        # [수정] SYSTEM, INFO 레벨도 슬랙으로 받아서 봇 생존신호 확인
-        important_levels = ['SUCCESS', 'WARNING', 'ERROR', 'TRADE', 'MARKET', 'SYSTEM']
-        
-        if self.slack_enabled and self.slack and (level in important_levels):
-            try:
-                color = "good"
-                if level == "ERROR": color = "danger"
-                elif level == "WARNING": color = "warning"
-                elif level == "SYSTEM": color = "#439FE0" # 파란색
-                
-                self.slack.send_message(
-                    title=f"[{level}] {message}",
-                    message="",
-                    color=color,
-                    fields=[{"title": "Details", "value": str(data), "short": False}] if data else None
-                )
-            except Exception as e:
-                print(f"⚠️ 슬랙 전송 실패: {e}")
+Markdown
 
-    # 편의 메서드
-    def info(self, msg, data=None): self.log('INFO', msg, data)
-    def system(self, msg, data=None): self.log('SYSTEM', msg, data)
-    def trade(self, msg, data=None): self.log('TRADE', msg, data)
-    def error(self, msg, data=None): self.log('ERROR', msg, data)
-    def warning(self, msg, data=None): self.log('WARNING', msg, data)
-2. main.py (RSI 조회 실패 원인 출력 & 강제 동기화)
-경로: 2cr-andy/trading/main.py
+야, 지금 코드는 장난감 수준이야. 실전에서 쓸 수 있게 구조를 싹 뜯어고쳐줘.
 
-Python
+[문제점 지적]
+1. **스캔 범위가 너무 좁아:** 거래량 상위 10개만 봐서는 알짜 종목 다 놓친다. 
+2. **종목명이 안 떠:** API 응답에 의존하지 말고 확실한 방법을 써.
+3. **효율성 꽝:** 10개밖에 안 보면서 루프 도는 건 자원 낭비야.
 
-#!/usr/bin/env python3
-"""
-KIS 자동매매 봇 - 디버깅 강화 버전
-"""
-import os
-import time
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import pytz
-from dotenv import load_dotenv
-from typing import Optional, List, Dict
+[요구사항 - 아키텍처 변경]
 
-import firebase_admin
-from firebase_admin import credentials, firestore
-from token_manager import TokenManager
-from logger_system import UnifiedLogger
+1. **후보군 수집 강화 (The 'Funnel' Strategy)**
+   - 단순히 `get_volume_ranking` 하나만 쓰지 마.
+   - **(1) 거래량 상위 30개** - **(2) 등락률 상위 30개 (순위조회 API 활용)**
+   - 위 두 결과를 합쳐서(중복 제거) 약 50~60개의 **'1차 후보군'**을 만들어.
 
-load_dotenv()
+2. **종목명(Name) 100% 보장 로직**
+   - 봇이 시작할 때(`__init__`) KIS API의 `search-stock-info`나 마스터 다운로드 기능을 활용해서 **'종목코드-종목명 매핑 테이블'**을 메모리에 구축해.
+   - 화면에 코드만 뜨는 일 없도록, 무조건 이 테이블에서 이름을 가져와서 표시해.
 
-class KISApiClient:
-    def __init__(self, token_manager: TokenManager, account_no: str):
-        self.token_manager = token_manager
-        self.account_no = account_no
-        self.app_key = os.getenv('KIS_APP_KEY')
-        self.app_secret = os.getenv('KIS_APP_SECRET')
-        self.base_url = "https://openapivts.koreainvestment.com:29443"
+3. **RSI 필터링 최적화**
+   - 1차 후보군(50개) 중에서 `가격 > 1000원` 같은 기본 조건 안 맞는 건 바로 버려.
+   - 살아남은 '정예 후보'들에 대해서만 `get_daily_price_history`를 호출해서 RSI를 계산해. (API 호출 낭비 방지)
 
-    def _get_headers(self, tr_id: str) -> Dict:
-        token = self.token_manager.get_token()
-        if not token: raise Exception("토큰 획득 실패")
-        return {
-            "authorization": f"Bearer {token}",
-            "appkey": self.app_key,
-            "appsecret": self.app_secret,
-            "tr_id": tr_id,
-            "custtype": "P"
-        }
+4. **웹 대시보드 데이터 포맷**
+   - Firebase에 저장할 때 `name`, `code`, `current_price`, `rsi`, `volume`, `buy_signal`(boolean) 필드를 명확히 넣어.
+   - 웹에서 RSI가 없으면 50이 아니라 null이나 0으로 가서 그래프가 비어 보이게 하지 말고, 계산된 값을 정확히 넣어.
 
-    def get_daily_price_history(self, stock_code: str) -> Optional[pd.DataFrame]:
-        """일봉 조회 (디버깅 추가)"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-        headers = self._get_headers("FHKST03010100")
-        
-        # 날짜 포맷 확인 (YYYYMMDD)
-        end_dt = datetime.now().strftime("%Y%m%d")
-        start_dt = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
+이 구조로 `main.py`와 필요한 클래스들을 다시 짜. 
+특히 `MarketScanner` 기능을 `main.py`에 통합할 때, **"넓게 퍼올려서(Fetching) -> 좁게 거르는(Filtering)"** 구조가 명확해야 해.
+🗣️ 유저님을 위한 팁
+이 방식대로 하면 API 호출량이 약간 늘어나지만, KIS 모의투자 서버는 충분히 버팁니다.
 
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": stock_code,
-            "FID_INPUT_DATE_1": start_dt,
-            "FID_INPUT_DATE_2": end_dt,
-            "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "0"
-        }
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if data['rt_cd'] == '0':
-                    items = data['output2']
-                    if not items: return None
-                    df = pd.DataFrame(items)
-                    # 필요한 컬럼만 추출 및 형변환
-                    df = df[['stck_bsop_date', 'stck_clpr', 'acml_vol']].copy()
-                    df.columns = ['date', 'close', 'volume']
-                    df['close'] = pd.to_numeric(df['close'])
-                    df = df.sort_values('date')
-                    return df
-                else:
-                    print(f"⚠️ API 에러 [{stock_code}]: {data.get('msg1')}")
-            else:
-                print(f"⚠️ HTTP 에러 [{stock_code}]: {res.status_code}")
-        except Exception as e:
-            print(f"❌ 일봉 조회 예외: {e}")
-        return None
+**"등락률 상위"**가 추가되면, 거래량은 안 터졌는데 가격만 급등하는 **'초기 급등주'**를 잡을 확률이 높아집니다.
 
-    # ... (나머지 메서드는 기존과 동일, 생략 가능하지만 전체 복붙 권장) ...
-    def get_stock_price(self, stock_code: str):
-        # (기존 코드 유지)
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        headers = self._get_headers("FHKST01010100")
-        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=3)
-            if res.status_code == 200 and res.json()['rt_cd'] == '0':
-                out = res.json()['output']
-                return {
-                    'code': stock_code,
-                    'name': out['hts_kor_isnm'],
-                    'current_price': float(out['stck_prpr']),
-                    'change_rate': float(out['prdy_ctrt']),
-                    'volume': int(out['acml_vol'])
-                }
-        except: pass
-        return None
+종목명은 **"시작할 때 한 번 명단표를 만드는 방식"**이 가장 확실합니다. 클로드가 이걸 구현해 줄 겁니다.
 
-    def get_volume_ranking(self):
-        # (기존 코드 유지)
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
-        headers = self._get_headers("FHPST01710000")
-        params = {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171","FID_INPUT_ISCD":"0000","FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0","FID_TRGT_CLS_CODE":"111111111","FID_TRGT_EXLS_CLS_CODE":"000000","FID_INPUT_PRICE_1":"","FID_VOL_CNT":""}
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            if res.status_code == 200 and res.json()['rt_cd'] == '0':
-                return res.json()['output'][:10]
-        except: pass
-        return []
-
-    def get_portfolio(self):
-        # (기존 코드 유지 - 예수금 포함)
-        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-        headers = self._get_headers("VTTC8434R")
-        params = {"CANO": self.account_no.split('-')[0], "ACNT_PRDT_CD": self.account_no.split('-')[1], "AFHR_FLPR_YN": "N", "OFL_YN": "N", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
-        try:
-            res = requests.get(url, headers=headers, params=params)
-            if res.status_code == 200 and res.json()['rt_cd'] == '0':
-                data = res.json()
-                holdings = []
-                for item in data['output1']:
-                    if int(float(item['hldg_qty'])) > 0:
-                        holdings.append({'code': item['pdno'], 'name': item['prdt_name'], 'quantity': int(float(item['hldg_qty'])), 'buy_price': float(item['pchs_avg_pric']), 'current_price': float(item['prpr']), 'profit_rate': float(item['evlu_pfls_rt'])})
-                return holdings, float(data['output2'][0]['dnca_tot_amt']), float(data['output2'][0]['tot_evlu_amt'])
-        except: pass
-        return [], 0, 0
-    
-    def sell_stock(self, code, qty): return True # 테스트용 안전장치 (실제 주문 시 주석 해제)
-
-class TradingEngine:
-    def __init__(self):
-        self.logger = UnifiedLogger()
-        self.kst = pytz.timezone('Asia/Seoul')
-        
-        # Firebase 강제 초기화
-        try:
-            if not firebase_admin._apps:
-                cred = credentials.Certificate(os.getenv('FIREBASE_ADMIN_KEY_PATH'))
-                firebase_admin.initialize_app(cred)
-            self.db = firestore.client()
-        except Exception as e:
-            self.logger.error(f"Firebase 초기화 실패: {e}")
-            raise e
-
-        # 설정
-        app_key = os.getenv('KIS_APP_KEY')
-        app_secret = os.getenv('KIS_APP_SECRET')
-        account_no = os.getenv('KIS_ACCOUNT_NUMBER')
-        if '-' not in account_no: account_no += "-01"
-        
-        self.token_manager = TokenManager(app_key, app_secret)
-        self.api_client = KISApiClient(self.token_manager, account_no)
-
-    def calculate_rsi(self, df, period=14):
-        """RSI 계산 (데이터 없으면 에러 로그)"""
-        if df is None or len(df) < period:
-            print("  ⚠️ RSI 계산 불가: 데이터 부족")
-            return 50.0
-        
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return float(100 - (100 / (1 + rs)).iloc[-1])
-
-    def sync_to_firebase(self, watchlist, portfolio, cash, asset):
-        """Firebase 동기화 (실패해도 무시하지 않고 에러 출력)"""
-        try:
-            # 1. Watchlist (Left Panel)
-            self.db.collection('market_scan').document('latest').set({
-                'stocks': watchlist,
-                'last_updated': firestore.SERVER_TIMESTAMP
-            })
-            print(f"  ☁️ Watchlist 동기화 완료 ({len(watchlist)}개)")
-
-            # 2. Account (Header)
-            self.db.collection('account').document('summary').set({
-                'totalAssets': asset,
-                'totalCash': cash,
-                'last_updated': firestore.SERVER_TIMESTAMP
-            })
-            
-        except Exception as e:
-            self.logger.error(f"Firebase 동기화 실패: {e}")
-
-    def run_cycle(self):
-        print(f"\n🔄 사이클 시작: {datetime.now(self.kst).strftime('%H:%M:%S')}")
-        
-        # 1. 내 잔고
-        portfolio, cash, asset = self.api_client.get_portfolio()
-        
-        # 2. 시장 스캔
-        volume_stocks = self.api_client.get_volume_ranking()
-        candidates = []
-        
-        if not volume_stocks:
-            print("  ❌ 거래량 상위 종목을 가져오지 못했습니다.")
-        
-        for stock in volume_stocks[:5]: # 테스트를 위해 상위 5개만
-            code = stock['mksc_shrn_iscd']
-            price_info = self.api_client.get_stock_price(code)
-            
-            if price_info:
-                # RSI 계산
-                df = self.api_client.get_daily_price_history(code)
-                rsi = self.calculate_rsi(df)
-                price_info['rsi'] = rsi
-                
-                print(f"  [{price_info['name']}] 현재가:{price_info['current_price']} RSI:{rsi:.1f}")
-                
-                # 매수 조건 (RSI 70 이하)
-                if rsi < 70:
-                    price_info['buy_signal'] = True
-                    candidates.append(price_info)
-            
-            time.sleep(0.2) # API 부하 조절
-
-        # 3. 결과 리포트 (데이터가 없어도 빈 리스트로 덮어써서 3일전 데이터 삭제)
-        self.sync_to_firebase(candidates, portfolio, cash, asset)
-
-    def run(self):
-        self.logger.system("🚀 봇 재시동 (RSI 디버깅 모드)")
-        while True:
-            try:
-                self.run_cycle()
-                time.sleep(60)
-            except KeyboardInterrupt:
-                self.logger.system("봇 종료")
-                break
-            except Exception as e:
-                self.logger.error(f"메인 루프 에러: {e}")
-                time.sleep(60)
-
-if __name__ == "__main__":
-    TradingEngine().run()
-🛠️ 실행 방법
-터미널에서 pip install pandas numpy (이미 하셨겠지만 혹시 모르니)
-
-python3 main.py 실행.
-
-콘솔 화면을 보세요.
-
-만약 ⚠️ API 에러: ...가 뜬다면 KIS API 문제(모의투자 신청 미완료 등)입니다.
-
-☁️ Watchlist 동기화 완료가 뜨면 웹 대시보드를 새로고침 해보세요. 3일 전 데이터가 사라지고 새 데이터(혹은 빈 화면)가 뜰 겁니다.
-
-슬랙에 "🚀 봇 재시동" 알림이 오는지 확인하세요.
-
-이제 봇이 거짓말을 못 하고 다 털어놓을 겁니다. 돌려보시고 에러 메시지 나오면 알려주세요.
+이걸로 다시 한 번 클로드를 혼내주러 가시죠! 결과 나오면 코드 한번 쓱 봐주세요.

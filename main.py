@@ -19,6 +19,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from token_manager import TokenManager
 from logger_system import UnifiedLogger
+from stock_master import StockMaster
 
 load_dotenv()
 
@@ -121,7 +122,7 @@ class KISApiClient:
         return None
 
     def get_volume_ranking(self) -> List[Dict]:
-        """거래량 상위 종목 조회"""
+        """거래량 상위 종목 조회 (확장: 30개)"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
         headers = self._get_headers("FHPST01710000")
         params = {
@@ -143,13 +144,46 @@ class KISApiClient:
                 if response.status_code == 200:
                     data = response.json()
                     if data.get('rt_cd') == '0':
-                        return data.get('output', [])[:20]
+                        return data.get('output', [])[:30]  # 30개로 확장
                 elif response.status_code == 500:
                     time.sleep(3)
                     continue
             except Exception as e:
                 if attempt == 2:
                     print(f"❌ 거래량 순위 조회 최종 실패: {e}")
+                time.sleep(2)
+        return []
+
+    def get_price_change_ranking(self) -> List[Dict]:
+        """등락률 상위 종목 조회 (신규)"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+        headers = self._get_headers("FHPST01710000")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20172",  # 등락률 순위
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": ""
+        }
+
+        for attempt in range(3):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('rt_cd') == '0':
+                        return data.get('output', [])[:30]  # 상위 30개
+                elif response.status_code == 500:
+                    time.sleep(3)
+                    continue
+            except Exception as e:
+                if attempt == 2:
+                    print(f"❌ 등락률 순위 조회 최종 실패: {e}")
                 time.sleep(2)
         return []
 
@@ -364,6 +398,7 @@ class TradingEngine:
         self.token_manager = TokenManager(app_key, app_secret)
         self.api_client = KISApiClient(self.token_manager, account_no)
         self.analyzer = TechnicalAnalyzer()
+        self.stock_master = StockMaster()  # 종목명 마스터 추가
 
         # 트레이딩 설정
         self.buy_amount = 500000  # 종목당 50만원
@@ -499,43 +534,99 @@ class TradingEngine:
         }
 
     def find_buy_opportunities(self) -> List[Dict]:
-        """매수 기회 탐색 (RSI/MFI 포함)"""
-        print("🔍 매수 기회 탐색 중 (기술적 지표 분석 포함)...")
+        """매수 기회 탐색 - Funnel Strategy 적용"""
+        print("\n🔍 확장된 매수 기회 탐색 (Funnel Strategy)...")
+        print("  📊 1단계: 후보군 수집 (거래량 + 등락률)")
 
-        # 거래량 상위 종목 조회
-        volume_stocks = self.api_client.get_volume_ranking()
-        if not volume_stocks:
-            print("❌ 거래량 데이터 없음")
-            return []
+        # 1단계: 넓게 후보군 수집
+        volume_stocks = self.api_client.get_volume_ranking()  # 거래량 상위 30개
+        price_change_stocks = self.api_client.get_price_change_ranking()  # 등락률 상위 30개
 
-        opportunities = []
+        # 종목 코드 중복 제거를 위한 dict 사용
+        candidates = {}
 
-        # 상위 10종목에 대해 상세 분석
-        for i, stock in enumerate(volume_stocks[:10], 1):
-            stock_code = stock.get('mksc_shrn_iscd', '').zfill(6)
-            if not stock_code or stock_code == '000000':
+        # 거래량 상위 종목 추가
+        for stock in volume_stocks:
+            code = stock.get('mksc_shrn_iscd', '').zfill(6)
+            if code and code != '000000':
+                candidates[code] = {
+                    'code': code,
+                    'name': self.stock_master.get_name(code),  # 마스터에서 종목명 100% 보장
+                    'from': 'volume'
+                }
+
+        # 등락률 상위 종목 추가 (중복 제거)
+        for stock in price_change_stocks:
+            code = stock.get('mksc_shrn_iscd', '').zfill(6)
+            if code and code != '000000':
+                if code not in candidates:
+                    candidates[code] = {
+                        'code': code,
+                        'name': self.stock_master.get_name(code),
+                        'from': 'price_change'
+                    }
+                else:
+                    candidates[code]['from'] = 'both'  # 양쪽 모두 포함
+
+        print(f"  ✅ 1차 후보군: {len(candidates)}개 종목 수집")
+
+        # 2단계: 메모리 내 빠른 필터링
+        print("  🔨 2단계: 기본 필터링 (가격/거래량)")
+        filtered_candidates = []
+
+        for code, info in candidates.items():
+            # 현재가 조회
+            price_data = self.api_client.get_stock_price(code)
+            if not price_data:
                 continue
 
-            print(f"  [{i}/10] {stock_code} 분석 중...")
+            # 기본 필터 조건
+            if price_data['current_price'] < 1000:  # 1000원 미만 제외
+                continue
+            if price_data['volume'] < 10000:  # 거래량 10000주 미만 제외
+                continue
+            if abs(price_data['change_rate']) > 29:  # 상한가/하한가 제외
+                continue
 
-            # 현재가 조회
-            price_data = self.api_client.get_stock_price(stock_code)
-            if price_data:
-                # 기술적 지표 계산 및 분석
-                analyzed_data = self.analyze_stock_with_indicators(stock_code, price_data)
+            # 필터 통과한 종목 저장
+            filtered_candidates.append({
+                **info,
+                **price_data
+            })
 
-                # 매수 신호가 있는 종목만 추가
-                if analyzed_data['buy_signal']:
-                    opportunities.append(analyzed_data)
-                    print(f"    💡 매수 신호 발견: {analyzed_data['name']}")
-                    print(f"       - RSI: {analyzed_data['rsi']:.1f}, MFI: {analyzed_data['mfi']:.1f}")
-                    print(f"       - 신호: {analyzed_data['signal_reasons']}")
-                else:
-                    print(f"    ⚪ {analyzed_data['name']}: RSI {analyzed_data['rsi']:.1f} (신호 없음)")
+            # API 부하 방지
+            time.sleep(0.1)
 
-            time.sleep(0.3)  # API 부하 방지
+        print(f"  ✅ 2차 필터 통과: {len(filtered_candidates)}개 종목")
 
-        print(f"📊 총 {len(opportunities)}개 매수 기회 발견")
+        # 3단계: 기술적 지표 분석 (RSI/MACD 등)
+        print("  📈 3단계: 기술적 지표 분석 (RSI/MACD/MFI)")
+        opportunities = []
+
+        # 최대 20개 종목만 상세 분석 (API 부하 고려)
+        for i, candidate in enumerate(filtered_candidates[:20], 1):
+            print(f"    [{i}/{min(20, len(filtered_candidates))}] {candidate['name']} 분석 중...")
+
+            # 기술적 지표 계산
+            analyzed_data = self.analyze_stock_with_indicators(candidate['code'], candidate)
+
+            # 모든 분석 데이터 추가 (매수 신호 여부와 관계없이)
+            analyzed_data['from_source'] = candidate['from']
+            opportunities.append(analyzed_data)
+
+            if analyzed_data['buy_signal']:
+                print(f"      💡 매수 신호! RSI: {analyzed_data['rsi']:.1f}, 이유: {analyzed_data['signal_reasons']}")
+            else:
+                print(f"      ⚪ 신호 없음 (RSI: {analyzed_data['rsi']:.1f})")
+
+            time.sleep(0.2)  # API 부하 방지
+
+        # 매수 신호가 있는 종목 우선 정렬
+        opportunities.sort(key=lambda x: (x['buy_signal'], x.get('rsi', 50)), reverse=False)
+
+        buy_signals = [x for x in opportunities if x['buy_signal']]
+        print(f"\n📊 분석 완료: {len(buy_signals)}개 매수 신호 / {len(opportunities)}개 분석")
+
         return opportunities
 
     def check_sell_conditions(self, portfolio: List[Dict]) -> List[Dict]:
@@ -620,7 +711,10 @@ class TradingEngine:
         # 4. 매수 실행
         portfolio_codes = [p['stock_code'] for p in portfolio]
 
-        for item in buy_opportunities[:2]:  # 최대 2종목
+        # 매수 신호가 있는 종목만 필터링
+        buy_signals = [x for x in buy_opportunities if x['buy_signal']]
+
+        for item in buy_signals[:2]:  # 최대 2종목
             # 이미 보유 중인 종목은 제외
             if item['code'] in portfolio_codes:
                 continue
@@ -633,6 +727,7 @@ class TradingEngine:
             quantity = int(self.buy_amount / item['current_price'])
             if quantity > 0:
                 print(f"\n💸 매수 실행: {item['name']} - {quantity}주")
+                print(f"   출처: {item.get('from_source', 'unknown')}")
                 print(f"   RSI: {item['rsi']:.1f}, MFI: {item['mfi']:.1f}")
                 print(f"   신호: {item['signal_reasons']}")
 
@@ -648,7 +743,8 @@ class TradingEngine:
                         'quantity': quantity,
                         'price': item['current_price'],
                         'rsi': item['rsi'],
-                        'signal': item['signal_reasons']
+                        'signal': item['signal_reasons'],
+                        'source': item.get('from_source')
                     })
                 else:
                     print(f"  ❌ 매수 실패")
@@ -658,7 +754,8 @@ class TradingEngine:
 
     def run(self):
         """메인 실행 루프"""
-        self.logger.system("🚀 자동매매 봇 시작 (RSI/MFI 지표 포함)")
+        self.logger.system("🚀 자동매매 봇 시작 (Funnel Strategy + RSI/MFI)")
+        print("📋 스캔 전략: 거래량 상위 30 + 등락률 상위 30 → 기술적 분석")
         print("📋 매수 조건: RSI < 30 또는 MACD 골든크로스 또는 거래량 급증")
         print("📋 매도 조건: 손절 -3%, 익절 +5%, RSI > 70")
         print("-" * 60)
