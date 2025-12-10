@@ -1,181 +1,84 @@
-1. 후보군 대폭 늘리기 (30개 → 약 90~100개)
-market_scanner.py의 scan_market 함수를 수정해서 그물을 넓게 펼칩니다.
+1. 뼈 때리는 분석: "여기 안 돌아갈 것 같은데요?" (Critical Issues)
+가장 심각한 문제는 **"단일 진실 공급원(Single Source of Truth)의 부재"**입니다.
 
-거래량 상위 (30개): 활발한 종목
+🚨 1. 봇이 대체 누굽니까? (Version Hell)
+현상: kis_bot.py, kis_bot_fixed.py, integrated_trading_bot.py, master_trading_bot.py, simple_auto_trader.py... 실행 가능한 메인 파일만 5개가 넘습니다.
 
-등락률 상위 (30개): 급등주 포착
+문제점: 각 파일마다 로직이 미세하게 다릅니다.
 
-거래대금 상위 (30개): New! (돈이 몰리는 진짜 주도주)
+kis_bot.py는 MarketScanner를 쓰지만, simple_auto_trader.py는 자체 로직을 씁니다.
 
-2. 500 에러 잡기 (재시도 로직)
-get_daily_candles 함수에 재시도(Retry) 로직을 넣어, API가 "힘들어!" 할 때 잠깐 쉬었다가 다시 요청하게 만듭니다. 이게 없으면 후보군이 100개여도 분석 성공은 0개가 됩니다.
+어떤 봇은 firebase에 market_scan/latest를 쓰고, 어떤 봇은 watchlist 컬렉션을 씁니다.
 
-🛠️ 코드 수정 가이드
-market_scanner.py 파일을 열고 아래 두 함수를 수정해 주세요.
+결과: run_trading_system.py를 실행했을 때, 내가 수정한 로직이 반영된 봇이 켜지는 건지, 구버전 봇이 켜지는 건지 확신할 수 없습니다. 실제 돈이 걸린 트레이딩에서 가장 위험한 상태입니다.
 
-수정 1: scan_market 함수 (후보군 확대 + 속도 조절)
-기존 함수를 지우고 이걸로 교체하세요. 거래대금 상위 로직은 get_volume_rank의 파라미터만 살짝 바꾸면 됩니다.
+🚨 2. 토큰 관리의 대혼란 (Race Condition)
+현상: token_manager.py가 있지만, market_scanner.py 내부에도 토큰 발급 로직이 있고, get_saved_token.py도 따로 돕니다.
 
-Python
+문제점: start_scheduler.py를 보면 market_scanner.py를 **subprocess(별도 프로세스)**로 실행합니다.
 
-    def scan_market(self) -> List[Dict]:
-        """시장 스캔: 후보군을 다양하게 수집 (맥북 전용 강화판)"""
-        print("\n🔍 시장 스캔 시작... (후보군 수집 중)")
+메인 봇 프로세스와 서브 프로세스(스캐너)가 동시에 kis_token.json을 읽거나 쓰려고 할 때 파일 잠금(File Lock) 처리가 완벽하지 않습니다.
 
-        candidates = set()
+특히 KIS API의 **"1분당 토큰 발급 제한"**을 피하기 위해 여러 장치를 뒀지만, 서로 다른 프로세스가 각자 시간을 카운트한다면 결국 API 호출 제한(429 Error)에 걸리거나 토큰이 꼬입니다.
 
-        # [A] 거래량 상위 30개
-        print("  1. 거래량 상위 수집 중...")
-        vol_stocks = self.get_volume_rank()
-        candidates.update(vol_stocks)
-        time.sleep(1.0) # API 휴식
+🚨 3. 동기식(Synchronous) 처리의 한계
+현상: market_scanner.py 를 보면 루프를 돌며 time.sleep(1.0)을 줍니다.
 
-        # [B] 등락률 상위 30개 (급등주)
-        print("  2. 등락률 상위 수집 중...")
-        price_stocks = self.get_price_change_rank()
-        candidates.update(price_stocks)
-        time.sleep(1.0)
+문제점: 종목 30개를 분석하려면 최소 30초+@가 걸립니다. 그동안 봇은 멈춰 있습니다.
 
-        # [C] (추가) 거래대금 상위 30개 - 돈이 몰리는 종목
-        # 거래량 API를 재활용하되 파라미터만 변경 (20171 -> 20172)
-        # ※ 이 부분은 별도 함수 없이 여기서 임시로 구현하거나, get_volume_rank에 인자를 추가해도 됩니다.
-        # 일단은 위 두 가지만으로도 60개 가까이 되므로 충분할 수 있습니다.
-        
-        print(f"\n📋 통합 후보군: 총 {len(candidates)}개 종목")
+이 30초 동안 보유 종목이 폭락해도 매도 로직이 돌지 않습니다. (Single Thread의 한계)
 
-        # 2. 상세 분석 (Rate Limit 고려하여 천천히)
-        qualified_stocks = []
-        
-        for i, stock_code in enumerate(candidates, 1):
-            print(f"[{i}/{len(candidates)}] 분석 중... {stock_code}")
-            
-            try:
-                # 일봉 데이터 조회 (재시도 로직 적용됨)
-                df = self.get_daily_candles(stock_code)
-                
-                # 데이터가 없으면 건너뛰기
-                if df is None or len(df) < 120:
-                    continue
-                
-                # 기술적 지표 계산
-                indicators = self.calculate_advanced_technicals(df)
-                if not indicators:
-                    continue
+비동기(asyncio) 처리가 되어 있지 않아, 네트워크 I/O가 발생할 때마다 CPU는 놀고 봇은 멍하니 기다립니다.
 
-                # 수급 데이터 (실패해도 진행)
-                smart_money = self.get_foreign_institution_buy(stock_code)
+🚨 4. 하드코딩된 '임시 방편'들이 메인 로직을 침범
+증거: simple_fix_data.py, fix_portfolio_317830.py 같은 파일들.
 
-                # 필터 조건 확인 (사용자님이 완화한 기준 적용됨)
-                if self.check_universe_filter(indicators, smart_money):
-                    # 매수 신호 확인
-                    buy_signal, buy_reason = self.check_buy_signal(indicators)
+문제점: 자동화 시스템인데 데이터가 꼬일 때마다 수동으로 DB를 고치는 스크립트를 돌려야 한다면, 그건 자동매매가 아닙니다. 이는 근본적인 데이터 동기화 로직(sync_firebase_data.py)에 결함이 있다는 뜻입니다.
 
-                    stock_info = {
-                        "code": stock_code,
-                        "price": indicators['current_price'],
-                        "rsi": indicators['rsi'],
-                        "adx": indicators['adx'],
-                        "buy_signal": buy_signal,
-                        "buy_reason": buy_reason
-                        # ... 필요한 필드 추가
-                    }
+2. 그래도 칭찬할 점 (Pros)
+Tech Stack 조합: Python(Backend) + Firebase(DB) + Flutter(Frontend) 조합은 확장성과 실시간성 면에서 아주 훌륭한 선택입니다. 특히 Firebase의 snapshots()을 활용한 실시간 대시보드 업데이트는 HTS 못지않은 UX를 제공합니다.
 
-                    qualified_stocks.append(stock_info)
-                    print(f"  ✅ 조건 충족! {buy_reason}")
+집요한 에러 핸들링: API 500 에러나 Rate Limit에 대응하기 위해 재시도(Retry) 로직과 지수 백오프(Exponential Backoff)를 구현하려 한 흔적(claude_debate_response.txt 내용 반영)은 높이 평가합니다.
 
-                # [중요] API 호출 속도 조절 (1초 대기)
-                time.sleep(1.0) 
+로그 시스템 (logger_system.py): 파일 로깅과 슬랙 알림을 통합하여 관리하려는 시도는 운영 관점에서 필수적이며 잘 구현되었습니다.
 
-            except Exception as e:
-                print(f"  ⚠️ 스킵: {e}")
-                time.sleep(1.0) # 에러 나도 쉬어줘야 함
-                continue
+3. MVVM 관점에서의 코드 평가 및 수정 방향
+유저분이 강조하신 MVVM 패턴에 맞춰 Python 코드를 본다면, 현재 구조는 Logic과 Data Access가 뒤섞여(Tightly Coupled) 있습니다.
 
-        # 결과 정렬 및 반환
-        qualified_stocks.sort(key=lambda x: (x['buy_signal'], -x['adx']), reverse=True)
-        return qualified_stocks[:10]
-수정 2: get_daily_candles 함수 (500 에러 방어)
-이 부분이 제일 중요합니다. 500 에러가 나면 포기하지 않고 3번까지 다시 시도합니다.
+🛠️ 수정 제안 (Refactoring Roadmap)
+Model (데이터 & 비즈니스 로직)
 
-Python
+현재: kis_bot.py 안에 API 호출, 데이터 가공, 매매 판단이 다 들어있음.
 
-    def get_daily_candles(self, stock_code: str, period: int = 150) -> pd.DataFrame:
-        """일봉 데이터 조회 (재시도 로직 추가)"""
-        token = self.get_access_token()
-        if not token:
-            return None
+수정:
 
-        end_date = datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.now() - timedelta(days=period)).strftime('%Y%m%d')
+StockRepository: KIS API 호출 및 Firebase 저장 전담 (데이터 소스 추상화).
 
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-        headers = {
-            "content-type": "application/json",
-            "authorization": f"Bearer {token}",
-            "appkey": self.app_key,
-            "appsecret": self.app_secret,
-            "tr_id": "FHKST03010100"
-        }
+TokenManager: 싱글톤 패턴으로 프로세스 간 안전한 토큰 관리.
 
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": stock_code,
-            "FID_INPUT_DATE_1": start_date,
-            "FID_INPUT_DATE_2": end_date,
-            "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "0"
-        }
+ViewModel (상태 관리 & 중개)
 
-        # [핵심] 최대 3회 재시도 로직
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, headers=headers, params=params)
-                
-                # 500번대 에러이거나 429(Too Many Requests)일 경우 예외 발생
-                if response.status_code >= 500 or response.status_code == 429:
-                    response.raise_for_status() 
+현재: market_scanner.py가 사실상 ViewModel 역할을 하려다 말았음.
 
-                data = response.json()
-                if data.get("rt_cd") == "0":
-                    output2 = data.get("output2", [])
-                    if not output2:
-                        return None
+수정:
 
-                    # DataFrame 생성 로직 (기존과 동일)
-                    df_data = []
-                    for row in output2:
-                        df_data.append({
-                            "date": pd.to_datetime(row.get("stck_bsop_date", "")),
-                            "open": float(row.get("stck_oprc", 0)),
-                            "high": float(row.get("stck_hgpr", 0)),
-                            "low": float(row.get("stck_lwpr", 0)),
-                            "close": float(row.get("stck_clpr", 0)),
-                            "volume": float(row.get("acml_vol", 0)),
-                            "amount": float(row.get("acml_tr_pbmn", 0))
-                        })
+TradingEngine: 매수/매도 시그널을 판단하고 상태를 관리. API 결과(Model)를 받아 가공 후 View(Firebase/Log)에 전달.
 
-                    df = pd.DataFrame(df_data)
-                    df.sort_values('date', inplace=True)
-                    df.reset_index(drop=True, inplace=True)
-                    return df
-                else:
-                    print(f"⚠️ API 오류 ({stock_code}): {data.get('msg1')}")
-                    return None
+이곳에서 asyncio를 도입하여 시세 조회와 매매 실행을 병렬로 처리해야 함.
 
-            except Exception as e:
-                # 마지막 시도였다면 실패 처리
-                if attempt == max_retries - 1:
-                    print(f"❌ 일봉 조회 최종 실패 ({stock_code}): {e}")
-                    return None
-                
-                # 잠시 대기 후 재시도 (1초, 2초, 4초...)
-                wait_time = (2 ** attempt)
-                print(f"🔄 에러 발생, {wait_time}초 후 재시도... ({attempt+1}/{max_retries})")
-                time.sleep(wait_time)
+View (표시)
 
-        return None
-🏁 결론
-맥북에서는 HTS를 쓸 수 없으니, **"파이썬 봇을 더 끈기 있게(Retry) 만들고, 더 넓게(후보군 확대) 보게 만드는 것"**이 정답입니다.
+현재: Flutter Dashboard (이건 잘 되어 있음).
 
-위 코드를 적용하시면, 속도는 조금 느려지더라도(종목당 1~2초) 500 에러 때문에 "0개 종목 선정"이 뜨는 일은 확실히 사라질 겁니다. 지금 바로 수정해 보시죠!
+수정: Python 측에서는 Logger와 SlackNotifier가 View의 역할을 일부 수행.
+
+🚀 결론: "그래서 이 코드로 돈 벌 수 있나요?"
+지금 상태로는 위험합니다. API 호출 제한에 걸려 봇이 멈추거나, 데이터가 꼬여서 매도 타이밍을 놓칠 확률이 높습니다.
+
+당장 해야 할 Action Plan:
+
+파일 통합: integrated_trading_bot.py나 kis_bot_fixed.py 중 하나를 골라 main.py로 확정하고 나머지는 backup/ 폴더로 치우세요.
+
+MarketScanner 독립 실행 중단: 스케줄러가 subprocess로 스캐너를 따로 띄우지 말고, 메인 봇 클래스 내부에서 메서드로 호출하게 바꾸거나, 토큰 매니저를 완벽한 서버/클라이언트 구조로 분리해야 합니다.
+
+배치 처리 도입: claude_debate_response.txt에 있는 조언대로, 종목을 하나씩 조회하지 말고 관심 종목 전체의 현재가를 한 번에 조회하는 API (주식현재가시세조회 등)를 활용하여 API 호출 횟수를 1/30로 줄이세요.

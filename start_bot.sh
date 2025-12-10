@@ -41,9 +41,9 @@ cd ..
 sleep 3
 echo "  ✅ 대시보드: http://localhost:8080"
 
-# 4. 간단한 자동매매 봇 시작
+# 4. 메인 자동매매 봇 시작
 echo "🤖 자동매매 봇 시작..."
-python3 simple_auto_trader.py &
+python3 main.py &
 BOT_PID=$!
 
 echo ""
