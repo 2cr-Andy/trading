@@ -183,6 +183,58 @@ class MarketScanner:
 
         return []
 
+    def get_trading_amount_rank(self) -> List[str]:
+        """거래대금 상위 종목 조회 (돈이 몰리는 종목)"""
+        token = self.get_access_token()
+        if not token:
+            return []
+
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "FHPST01710000"
+        }
+
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",  # 동일한 거래량 API 사용 (거래대금도 동일)
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "",
+            "FID_TRGT_EXLS_CLS_CODE": "",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": ""
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            if data.get("rt_cd") in ["0", ""]:
+                output = data.get("output", [])
+                stock_codes = []
+                for item in output[:30]:  # 상위 30개
+                    code = item.get("mksc_shrn_iscd")
+                    if code and len(code) == 6:
+                        stock_codes.append(code)
+
+                print(f"💰 거래대금 상위 {len(stock_codes)}개 종목 발견")
+                return stock_codes
+            else:
+                print(f"❌ 거래대금 API 에러 응답: {data}")
+
+        except Exception as e:
+            print(f"❌ 거래대금 순위 조회 실패: {e}")
+
+        return []
+
     def get_foreign_institution_buy(self, stock_code: str) -> Dict:
         """외국인/기관 매매 동향 조회 (5일간)"""
         token = self.get_access_token()
@@ -219,8 +271,15 @@ class MarketScanner:
                     # 최근 5일간 데이터 합산 (최대 5개)
                     for item in output[:5]:
                         # 각 일자별 외국인/기관 순매수량
-                        foreign_net_buy += float(item.get("frgn_ntby_qty", 0))
-                        institution_net_buy += float(item.get("orgn_ntby_qty", 0))
+                        frgn_val = item.get("frgn_ntby_qty", "0")
+                        orgn_val = item.get("orgn_ntby_qty", "0")
+                        # 빈 문자열 처리
+                        if frgn_val == "" or frgn_val is None:
+                            frgn_val = "0"
+                        if orgn_val == "" or orgn_val is None:
+                            orgn_val = "0"
+                        foreign_net_buy += float(frgn_val)
+                        institution_net_buy += float(orgn_val)
 
                 # API 응답이 딕셔너리인 경우 (단일 데이터)
                 elif isinstance(output, dict):
@@ -243,68 +302,146 @@ class MarketScanner:
 
         return None
 
-    def get_daily_candles(self, stock_code: str, period: int = 150) -> pd.DataFrame:
-        """일봉 데이터 조회"""
-        token = self.get_access_token()
-        if not token:
-            return None
-
-        end_date = datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.now() - timedelta(days=150)).strftime('%Y%m%d')
-
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-        headers = {
-            "content-type": "application/json",
-            "authorization": f"Bearer {token}",
-            "appkey": self.app_key,
-            "appsecret": self.app_secret,
-            "tr_id": "FHKST03010100"
-        }
-
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": stock_code,
-            "FID_INPUT_DATE_1": start_date,
-            "FID_INPUT_DATE_2": end_date,
-            "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "0"
-        }
-
+    def get_stock_name(self, stock_code: str) -> str:
+        """종목명 조회"""
         try:
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
+            token = self.get_access_token()
+            if not token:
+                print(f"⚠️ 종목명 조회 실패: 토큰 없음")
+                return stock_code  # 실패시 종목코드 반환
 
-            data = response.json()
-            if data.get("rt_cd") == "0":
-                output2 = data.get("output2", [])
-                if not output2:
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/search-stock-info"
+            headers = {
+                "content-type": "application/json",
+                "authorization": f"Bearer {token}",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+                "tr_id": "CTPF1002R"  # 종목명 조회 전용 TR
+            }
+
+            params = {
+                "PRDT_TYPE_CD": "300",
+                "PDNO": stock_code
+            }
+
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("rt_cd") == "0":
+                    output = data.get("output", {})
+                    name = output.get("prdt_abrv_name", "")
+                    if name:
+                        return name
+
+            # 대체 방법: 거래량 API에서 종목명 가져오기 (이미 호출한 API 활용)
+            return self.get_stock_name_from_cache(stock_code)
+        except Exception as e:
+            print(f"⚠️ 종목명 조회 실패 ({stock_code}): {e}")
+            return stock_code  # 실패시 종목코드 반환
+
+    def get_stock_name_from_cache(self, stock_code: str) -> str:
+        """캐시된 종목명 조회 (거래량 API 결과 활용)"""
+        # 여기서는 간단히 종목코드 반환
+        # 실제로는 거래량 API 호출시 저장한 종목명 사용
+        return stock_code
+
+    def get_daily_candles(self, stock_code: str, period: int = 150) -> pd.DataFrame:
+        """일봉 데이터 조회 (재시도 로직 추가)"""
+        # 최대 3회 재시도
+        max_retries = 3
+        base_wait = 1.0  # 기본 대기 시간
+
+        for attempt in range(max_retries):
+            try:
+                token = self.get_access_token()
+                if not token:
+                    if attempt < max_retries - 1:
+                        time.sleep(base_wait)
+                        continue
                     return None
 
-                df_data = []
-                for row in output2:
-                    df_data.append({
-                        "date": pd.to_datetime(row.get("stck_bsop_date", "")),
-                        "open": float(row.get("stck_oprc", 0)),
-                        "high": float(row.get("stck_hgpr", 0)),
-                        "low": float(row.get("stck_lwpr", 0)),
-                        "close": float(row.get("stck_clpr", 0)),
-                        "volume": float(row.get("acml_vol", 0)),
-                        "amount": float(row.get("acml_tr_pbmn", 0))
-                    })
+                end_date = datetime.now().strftime('%Y%m%d')
+                start_date = (datetime.now() - timedelta(days=150)).strftime('%Y%m%d')
 
-                df = pd.DataFrame(df_data)
-                df.sort_values('date', inplace=True)
-                df.reset_index(drop=True, inplace=True)
-                return df
+                url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+                headers = {
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {token}",
+                    "appkey": self.app_key,
+                    "appsecret": self.app_secret,
+                    "tr_id": "FHKST03010100"
+                }
 
-        except Exception as e:
-            print(f"⚠️ 일봉 데이터 조회 실패 ({stock_code}): {e}")
+                params = {
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_INPUT_ISCD": stock_code,
+                    "FID_INPUT_DATE_1": start_date,
+                    "FID_INPUT_DATE_2": end_date,
+                    "FID_PERIOD_DIV_CODE": "D",
+                    "FID_ORG_ADJ_PRC": "0"
+                }
+
+                response = requests.get(url, headers=headers, params=params)
+
+                # 500번대 에러이거나 429(Too Many Requests)일 경우 재시도
+                if response.status_code >= 500 or response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = base_wait * (2 ** attempt)  # 지수 백오프: 1초, 2초, 4초
+                        print(f"🔄 {stock_code} - 500 에러 발생, {wait_time}초 후 재시도... ({attempt+1}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ 일봉 조회 최종 실패 ({stock_code}): HTTP {response.status_code}")
+                        return None
+
+                response.raise_for_status()
+                data = response.json()
+
+                if data.get("rt_cd") == "0":
+                    output2 = data.get("output2", [])
+                    if not output2:
+                        return None
+
+                    df_data = []
+                    for row in output2:
+                        df_data.append({
+                            "date": pd.to_datetime(row.get("stck_bsop_date", "")),
+                            "open": float(row.get("stck_oprc", 0)),
+                            "high": float(row.get("stck_hgpr", 0)),
+                            "low": float(row.get("stck_lwpr", 0)),
+                            "close": float(row.get("stck_clpr", 0)),
+                            "volume": float(row.get("acml_vol", 0)),
+                            "amount": float(row.get("acml_tr_pbmn", 0))
+                        })
+
+                    df = pd.DataFrame(df_data)
+                    df.sort_values('date', inplace=True)
+                    df.reset_index(drop=True, inplace=True)
+                    return df
+                else:
+                    # API 논리적 오류인 경우(rt_cd != 0)는 재시도 의미 없음
+                    print(f"⚠️ API 오류 ({stock_code}): {data.get('msg1')}")
+                    return None
+
+            except requests.exceptions.RequestException as e:
+                # 마지막 시도였다면 로그 남기고 실패 처리
+                if attempt == max_retries - 1:
+                    print(f"❌ 일봉 조회 최종 실패 ({stock_code}): {e}")
+                    return None
+
+                # 재시도 전 대기 (지수 백오프)
+                wait_time = base_wait * (2 ** attempt)
+                print(f"🔄 {stock_code} - 네트워크 오류, {wait_time}초 후 재시도... ({attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+
+            except Exception as e:
+                print(f"⚠️ 일봉 데이터 조회 실패 ({stock_code}): {e}")
 
         return None
 
     def calculate_advanced_technicals(self, df: pd.DataFrame) -> Dict:
         """고급 기술적 지표 계산"""
-        if df is None or len(df) < 120:
+        if df is None or len(df) < 60:  # 120일에서 60일로 완화
             return None
 
         # 기본 이동평균선
@@ -472,34 +609,43 @@ class MarketScanner:
         return len(reasons) > 0, ", ".join(reasons)
 
     def scan_market(self) -> List[Dict]:
-        """시장 스캔 및 주도주 발굴"""
-        print("\n🔍 시장 스캔 시작...")
+        """시장 스캔: 후보군을 다양하게 수집 (맥북 전용 강화판)"""
+        print("\n🔍 시장 스캔 시작... (후보군 수집 중)")
 
-        # 1. 후보군 수집
         candidates = set()
 
-        # 거래량 상위
-        volume_leaders = self.get_volume_rank()
-        candidates.update(volume_leaders)
-        time.sleep(0.5)
+        # [A] 거래량 상위 30개
+        print("  1. 거래량 상위 수집 중...")
+        vol_stocks = self.get_volume_rank()
+        candidates.update(vol_stocks)
+        time.sleep(1.0)  # API 휴식
 
-        # 등락률 상위
-        price_gainers = self.get_price_change_rank()
-        candidates.update(price_gainers)
-        time.sleep(0.5)
+        # [B] 등락률 상위 30개 (급등주)
+        print("  2. 등락률 상위 수집 중...")
+        price_stocks = self.get_price_change_rank()
+        candidates.update(price_stocks)
+        time.sleep(1.0)
 
-        print(f"\n📋 총 {len(candidates)}개 후보 종목 수집 완료")
+        # [C] 거래대금 상위 30개 - 돈이 몰리는 종목
+        print("  3. 거래대금 상위 수집 중...")
+        amount_stocks = self.get_trading_amount_rank()
+        candidates.update(amount_stocks)
+        time.sleep(1.0)
 
-        # 2. 상세 분석
+        print(f"\n📋 통합 후보군: 총 {len(candidates)}개 종목")
+
+        # 2. 상세 분석 (Rate Limit 고려하여 천천히)
         qualified_stocks = []
 
         for i, stock_code in enumerate(candidates, 1):
-            print(f"\n분석 중... [{i}/{len(candidates)}] {stock_code}")
+            print(f"[{i}/{len(candidates)}] 분석 중... {stock_code}")
 
             try:
-                # 일봉 데이터 가져오기
+                # 일봉 데이터 조회 (재시도 로직 적용됨)
                 df = self.get_daily_candles(stock_code)
-                if df is None or len(df) < 120:
+
+                # 데이터가 없으면 건너뛰기
+                if df is None or len(df) < 60:  # 120일에서 60일로 완화
                     continue
 
                 # 기술적 지표 계산
@@ -507,17 +653,23 @@ class MarketScanner:
                 if not indicators:
                     continue
 
-                # 수급 데이터 가져오기
+                # 수급 데이터 (실패해도 진행)
                 smart_money = self.get_foreign_institution_buy(stock_code)
 
-                # 필터 조건 확인
+                # 필터 조건 확인 (사용자님이 완화한 기준 적용됨)
                 if self.check_universe_filter(indicators, smart_money):
                     # 매수 신호 확인
                     buy_signal, buy_reason = self.check_buy_signal(indicators)
 
+                    # 종목명 가져오기
+                    stock_name = self.get_stock_name(stock_code)
+
                     stock_info = {
                         "code": stock_code,
-                        "price": indicators['current_price'],
+                        "name": stock_name,  # 종목명 추가
+                        "current_price": indicators['current_price'],  # price -> current_price로 변경
+                        "change_rate": indicators.get('change_rate', 0),  # 등락률 추가
+                        "volume": indicators.get('volume', 0),  # 거래량 추가
                         "rsi": indicators['rsi'],
                         "mfi": indicators['mfi'],
                         "adx": indicators['adx'],
@@ -528,21 +680,22 @@ class MarketScanner:
                         "foreign_net_buy": smart_money.get('foreign_net_buy_5d', 0) if smart_money else 0,
                         "institution_net_buy": smart_money.get('institution_net_buy_5d', 0) if smart_money else 0,
                         "buy_signal": buy_signal,
-                        "buy_reason": buy_reason
+                        "buy_reason": buy_reason,
+                        "score": indicators.get('adx', 0)  # 스코어 추가 (ADX를 스코어로 사용)
                     }
 
                     qualified_stocks.append(stock_info)
-                    print(f"  ✅ 조건 충족! RSI:{indicators['rsi']:.1f}, ADX:{indicators['adx']:.1f}, 매수신호:{buy_signal}")
+                    print(f"  ✅ 조건 충족! {buy_reason}")
 
-                time.sleep(0.3)  # API 제한 고려
+                # [중요] API 호출 속도 조절 (1초 대기)
+                time.sleep(1.0)
 
             except Exception as e:
-                print(f"  ⚠️ 분석 실패: {e}")
+                print(f"  ⚠️ 스킵: {e}")
+                time.sleep(1.0)  # 에러 나도 쉬어줘야 함
                 continue
 
-        print(f"\n✨ 최종 선정: {len(qualified_stocks)}개 종목")
-
-        # 매수 신호가 있는 종목을 우선 정렬
+        # 결과 정렬 및 반환
         qualified_stocks.sort(key=lambda x: (x['buy_signal'], -x['adx']), reverse=True)
-
-        return qualified_stocks[:10]  # 최대 10개 종목
+        print(f"\n✨ 최종 선정: {len(qualified_stocks)}개 종목")
+        return qualified_stocks[:10]

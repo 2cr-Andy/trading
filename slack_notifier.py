@@ -22,12 +22,12 @@ class SlackNotifier:
             self.webhook_url = None  # Bot Token 사용시 Webhook 비활성화
         self.enabled = bool(self.webhook_url or self.bot_token)
 
-        # 채널별 웹훅 URL (향후 확장용)
+        # 채널별 설정 (Bot Token용 # 추가)
         self.channels = {
-            'trading': 'kis-bot-trading',    # # 제거
-            'deploy': 'kis-bot-deploy',      # # 제거
-            'errors': 'kis-bot-errors',      # # 제거
-            'summary': 'kis-bot-summary'     # # 제거
+            'trading': '#kis-bot-trading',
+            'deploy': '#kis-bot-deploy',
+            'errors': '#kis-bot-errors',
+            'summary': '#kis-bot-summary'
         }
 
         if not self.enabled:
@@ -139,7 +139,7 @@ class SlackNotifier:
 
     def notify_bot_start(self):
         """봇 시작 알림"""
-        self.send_message(
+        return self.send_message(
             title="🚀 KIS Bot Started",
             message="자동매매 봇이 성공적으로 시작되었습니다.",
             color="good",

@@ -20,6 +20,7 @@ import pytz
 from slack_notifier import SlackNotifier
 from logger_system import UnifiedLogger
 from token_manager import TokenManager
+from single_instance import SingleInstance
 import warnings
 
 # Firebase 경고 무시
@@ -31,6 +32,10 @@ sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', 1)
 
 # 환경 변수 로드
 load_dotenv()
+
+# 단일 인스턴스 보장 - 기존 봇 자동 정리
+single_instance = SingleInstance("kis_bot_fixed")
+single_instance.ensure_single_instance()
 
 class KISBot:
     def __init__(self):
@@ -104,6 +109,8 @@ class KISBot:
                 for stock in candidates[:10]:  # 상위 10개 종목
                     watchlist.append({
                         "code": stock['code'],
+                        "name": stock.get('name', ''),
+                        "price": stock.get('current_price', 0),
                         "buy_signal": stock.get('buy_signal', False),
                         "reason": stock.get('buy_reason', '')
                     })
@@ -158,6 +165,111 @@ class KISBot:
             self.logger.error("시장 스캔 실패", {"error": str(e)})
             return []
 
+    def execute_buy_order(self, stock_code: str, stock_name: str, price: int, quantity: int = 1) -> bool:
+        """매수 주문 실행"""
+        try:
+            token = self.get_access_token()
+            if not token:
+                return False
+
+            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+
+            headers = {
+                "content-type": "application/json",
+                "authorization": f"Bearer {token}",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+                "tr_id": "VTTC0802U"  # 모의투자 매수
+            }
+
+            data = {
+                "CANO": self.account_number[:8],
+                "ACNT_PRDT_CD": self.account_number[8:],
+                "PDNO": stock_code,
+                "ORD_DVSN": "01",  # 시장가
+                "ORD_QTY": str(quantity),
+                "ORD_UNPR": "0",  # 시장가는 0
+            }
+
+            response = requests.post(url, headers=headers, json=data)
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("rt_cd") == "0":
+                    self.logger.success(f"💰 매수 주문 성공: {stock_name}({stock_code})", {
+                        "수량": quantity,
+                        "주문번호": result.get("output", {}).get("ODNO")
+                    })
+
+                    # 포트폴리오에 추가
+                    self.portfolio[stock_code] = {
+                        "name": stock_name,
+                        "quantity": quantity,
+                        "buy_price": price,
+                        "buy_time": datetime.now(self.kst_timezone).isoformat()
+                    }
+
+                    # Firebase에 포트폴리오 저장
+                    try:
+                        self.db.collection('portfolio').document(stock_code).set({
+                            'code': stock_code,
+                            'name': stock_name,
+                            'quantity': quantity,
+                            'buy_price': price,
+                            'buy_time': datetime.now(self.kst_timezone).isoformat(),
+                            'status': 'holding'
+                        })
+                    except:
+                        pass
+
+                    return True
+                else:
+                    self.logger.error(f"매수 주문 실패: {result.get('msg1')}")
+                    return False
+            else:
+                self.logger.error(f"매수 API 호출 실패: {response.status_code}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"매수 주문 중 오류", {"error": str(e)})
+            return False
+
+    def check_and_execute_buy_signals(self):
+        """매수 신호 확인 및 실행"""
+        if len(self.portfolio) >= self.max_positions:
+            self.logger.info(f"최대 보유 종목 수({self.max_positions}) 도달")
+            return
+
+        for stock in self.current_watchlist:
+            # 이미 보유 중인 종목은 제외
+            if stock['code'] in self.portfolio:
+                continue
+
+            # 매수 신호가 있는 종목만
+            if stock.get('buy_signal'):
+                # 현재 보유 종목이 최대치 미만일 때만 매수
+                if len(self.portfolio) < self.max_positions:
+                    self.logger.info(f"매수 시도: {stock['name']}({stock['code']})")
+
+                    # 매수 수량 계산 (간단히 1주로 설정)
+                    quantity = 1
+
+                    # 매수 주문 실행
+                    success = self.execute_buy_order(
+                        stock['code'],
+                        stock['name'],
+                        stock['price'],
+                        quantity
+                    )
+
+                    if success:
+                        # 매수 성공 시 잠시 대기
+                        time.sleep(2)
+
+                    # 최대 보유 종목 수 도달 시 중단
+                    if len(self.portfolio) >= self.max_positions:
+                        break
+
     def is_trading_time(self) -> bool:
         """장 운영 시간 체크 (평일 9:00-15:20)"""
         now = datetime.now(self.kst_timezone)
@@ -181,6 +293,10 @@ class KISBot:
         # 초기 시장 스캔
         self.scan_market_conditions()
 
+        # 초기 스캔 후 매수 신호 확인
+        if self.current_watchlist:
+            self.check_and_execute_buy_signals()
+
         loop_count = 1  # 0이 아닌 1로 시작해서 중복 스캔 방지
         error_count = 0
         max_errors = 10
@@ -200,6 +316,10 @@ class KISBot:
                 # 5분마다 시장 스캔
                 if loop_count % 300 == 0:
                     self.scan_market_conditions()
+
+                    # 매수 신호가 있으면 매수 실행
+                    if self.current_watchlist:
+                        self.check_and_execute_buy_signals()
 
                 # 에러 카운트 초기화
                 error_count = 0

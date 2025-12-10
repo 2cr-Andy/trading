@@ -21,8 +21,8 @@ class PortfolioItem {
 
   factory PortfolioItem.fromFirestore(Map<String, dynamic> data, String id) {
     final quantity = data['quantity'] ?? 0;
-    final avgPrice = (data['avgPrice'] ?? 0).toDouble();
-    final currentPrice = (data['currentPrice'] ?? 0).toDouble();
+    final avgPrice = (data['buy_price'] ?? 0).toDouble();
+    final currentPrice = (data['current_price'] ?? 0).toDouble();
     final totalValue = quantity * currentPrice;
     final pnl = (currentPrice - avgPrice) * quantity;
     final pnlPercent = avgPrice > 0 ? ((currentPrice - avgPrice) / avgPrice) * 100 : 0;

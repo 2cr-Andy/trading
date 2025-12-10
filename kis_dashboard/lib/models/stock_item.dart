@@ -34,4 +34,18 @@ class StockItem {
       nearBuySignal: data['nearBuySignal'] ?? false,
     );
   }
+
+  factory StockItem.fromMarketScan(Map<String, dynamic> data) {
+    return StockItem(
+      code: data['code'] ?? '',
+      name: data['name'] ?? '',
+      currentPrice: (data['current_price'] ?? 0).toDouble(),
+      changePercent: (data['change_rate'] ?? 0).toDouble(),
+      volume: (data['volume'] ?? 0).toDouble(),
+      volumeChange: (data['volume_change'] ?? 0).toDouble(),
+      rsi: (data['rsi'] ?? 50).toDouble(),
+      mfi: (data['mfi'] ?? 50).toDouble(),
+      nearBuySignal: data['buy_signal'] ?? false,
+    );
+  }
 }

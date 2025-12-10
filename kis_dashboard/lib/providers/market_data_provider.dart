@@ -64,15 +64,19 @@ class MarketDataProvider extends ChangeNotifier {
       }
     });
 
-    // 감시 종목 스트림
-    _firestore.collection('watchlist')
-        .orderBy('volume_change', descending: true)
+    // 감시 종목 스트림 - market_scan의 latest 문서에서 stocks 배열 읽기
+    _firestore.collection('market_scan')
+        .doc('latest')
         .snapshots()
         .listen((snapshot) {
-      _watchlist = snapshot.docs
-          .map((doc) => StockItem.fromFirestore(doc.data(), doc.id))
-          .toList();
-      notifyListeners();
+      if (snapshot.exists && snapshot.data() != null) {
+        final data = snapshot.data()!;
+        final stocksList = data['stocks'] as List<dynamic>? ?? [];
+        _watchlist = stocksList
+            .map((stockData) => StockItem.fromMarketScan(stockData))
+            .toList();
+        notifyListeners();
+      }
     });
 
     // 포트폴리오 스트림

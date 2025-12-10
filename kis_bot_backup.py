@@ -536,7 +536,7 @@ class KISBot:
         print(f"\n✨ 최종 선정 종목: {len(stock_codes)}개")
         for stock in qualified_stocks[:5]:  # 상위 5개만 표시
             signal_text = f"🔴 매수신호: {stock['buy_reason']}" if stock['buy_signal'] else "⚪ 대기"
-            print(f"  📌 {stock['code']}: {stock.get('current_price', 0):,.0f}원 | RSI:{stock.get('rsi', 0):.1f} | ADX:{stock.get('adx', 0):.1f} | {signal_text}")
+            print(f"  📌 {stock['code']}: {stock.get('current_price', 0):,.0f}원 | RSI:{stock.get('rsi', 0):.1f} | {signal_text}")
 
         return stock_codes[:5]  # 최대 5개 종목 감시
 
