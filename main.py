@@ -382,6 +382,10 @@ class TradingEngine:
         if portfolio:
             self.sync_portfolio_to_firebase(portfolio)
 
+        # 계좌 잔고도 동기화 (예수금 정보 업데이트)
+        # TODO: get_portfolio에서 예수금도 반환하도록 수정 필요
+        self.sync_account_to_firebase()
+
         # 2. 매도 조건 체크 및 실행
         sell_opportunities = self.check_sell_conditions()
         for item in sell_opportunities:
