@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-KIS 자동매매 봇 - MVVM 패턴 적용
-- Model: TokenManager, KISApiClient (데이터 및 API)
-- ViewModel: TradingEngine (매매 로직 판단)
-- View: Logger, Firebase (상태 표시)
+KIS 자동매매 봇 - 완전체 버전
+- MVVM 패턴 + RSI/MACD 지표 계산 + Firebase 실시간 동기화
 """
 
 import os
 import time
 import requests
-from datetime import datetime
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
-# Firebase 추가
+# Firebase 및 커스텀 모듈
 import firebase_admin
 from firebase_admin import credentials, firestore
-
-# 기존 모듈들 재사용 (중복 제거!)
 from token_manager import TokenManager
 from logger_system import UnifiedLogger
 
@@ -26,7 +24,7 @@ load_dotenv()
 
 
 class KISApiClient:
-    """KIS API 호출 담당 (Model 역할) - 단일 책임 원칙"""
+    """KIS API 호출 담당 (Model) - 일봉 데이터 조회 추가"""
 
     def __init__(self, token_manager: TokenManager, account_no: str):
         self.token_manager = token_manager
@@ -49,6 +47,42 @@ class KISApiClient:
             "custtype": "P"
         }
 
+    def get_daily_price_history(self, stock_code: str, days: int = 30) -> Optional[pd.DataFrame]:
+        """일봉 데이터 조회 (RSI/MACD 계산용)"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        headers = self._get_headers("FHKST03010100")
+
+        # 날짜 범위 설정
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start_date,
+            "FID_INPUT_DATE_2": end_date,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0"
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('rt_cd') == '0' and data.get('output2'):
+                    # DataFrame 변환
+                    df = pd.DataFrame(data['output2'])
+                    df['date'] = pd.to_datetime(df['stck_bsop_date'])
+                    df['close'] = df['stck_clpr'].astype(float)
+                    df['high'] = df['stck_hgpr'].astype(float)
+                    df['low'] = df['stck_lwpr'].astype(float)
+                    df['volume'] = df['acml_vol'].astype(float)
+                    df = df.sort_values('date')
+                    return df[['date', 'close', 'high', 'low', 'volume']]
+        except Exception as e:
+            print(f"⚠️ 일봉 데이터 조회 실패 ({stock_code}): {e}")
+        return None
+
     def get_stock_price(self, stock_code: str) -> Optional[Dict]:
         """개별 종목 현재가 조회"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -58,7 +92,6 @@ class KISApiClient:
             "FID_INPUT_ISCD": stock_code
         }
 
-        # 재시도 로직 (3회)
         for attempt in range(3):
             try:
                 response = requests.get(url, headers=headers, params=params, timeout=5)
@@ -74,7 +107,7 @@ class KISApiClient:
                             'volume': int(output.get('acml_vol', 0))
                         }
                 elif response.status_code == 500:
-                    time.sleep(2 ** attempt)  # 지수 백오프
+                    time.sleep(2 ** attempt)
                     continue
             except Exception as e:
                 if attempt == 2:
@@ -115,8 +148,8 @@ class KISApiClient:
                 time.sleep(2)
         return []
 
-    def get_portfolio(self) -> List[Dict]:
-        """포트폴리오 조회"""
+    def get_portfolio(self) -> Tuple[List[Dict], float, float]:
+        """포트폴리오 및 계좌 정보 조회"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         headers = self._get_headers("VTTC8434R")
         params = {
@@ -150,10 +183,16 @@ class KISApiClient:
                                 'profit_loss': float(item.get('evlu_pfls_amt', 0)),
                                 'profit_rate': float(item.get('evlu_pfls_rt', 0))
                             })
-                    return holdings
+
+                    # 계좌 정보 추출
+                    output2 = data.get('output2', [{}])[0]
+                    cash = float(output2.get('dnca_tot_amt', 0))
+                    total_assets = float(output2.get('tot_evlu_amt', 0))
+
+                    return holdings, cash, total_assets
         except Exception as e:
             print(f"❌ 포트폴리오 조회 실패: {e}")
-        return []
+        return [], 0, 0
 
     def buy_stock(self, stock_code: str, quantity: int) -> bool:
         """매수 주문 (시장가)"""
@@ -204,6 +243,95 @@ class KISApiClient:
         return False
 
 
+class TechnicalAnalyzer:
+    """기술적 지표 계산 클래스"""
+
+    @staticmethod
+    def calculate_rsi(df: pd.DataFrame, period: int = 14) -> float:
+        """RSI (Relative Strength Index) 계산"""
+        if df is None or len(df) < period + 1:
+            return 50.0  # 기본값
+
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+
+        return float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
+
+    @staticmethod
+    def calculate_macd(df: pd.DataFrame) -> Dict[str, float]:
+        """MACD (Moving Average Convergence Divergence) 계산"""
+        if df is None or len(df) < 26:
+            return {'macd': 0, 'signal': 0, 'histogram': 0}
+
+        # 12일, 26일 EMA 계산
+        ema12 = df['close'].ewm(span=12).mean()
+        ema26 = df['close'].ewm(span=26).mean()
+
+        # MACD = 12일 EMA - 26일 EMA
+        macd = ema12 - ema26
+
+        # Signal = MACD의 9일 EMA
+        signal = macd.ewm(span=9).mean()
+
+        # Histogram = MACD - Signal
+        histogram = macd - signal
+
+        return {
+            'macd': float(macd.iloc[-1]) if not pd.isna(macd.iloc[-1]) else 0,
+            'signal': float(signal.iloc[-1]) if not pd.isna(signal.iloc[-1]) else 0,
+            'histogram': float(histogram.iloc[-1]) if not pd.isna(histogram.iloc[-1]) else 0
+        }
+
+    @staticmethod
+    def calculate_bollinger_bands(df: pd.DataFrame, period: int = 20) -> Dict[str, float]:
+        """볼린저 밴드 계산"""
+        if df is None or len(df) < period:
+            return {'upper': 0, 'middle': 0, 'lower': 0}
+
+        sma = df['close'].rolling(window=period).mean()
+        std = df['close'].rolling(window=period).std()
+
+        upper = sma + (std * 2)
+        lower = sma - (std * 2)
+
+        return {
+            'upper': float(upper.iloc[-1]) if not pd.isna(upper.iloc[-1]) else 0,
+            'middle': float(sma.iloc[-1]) if not pd.isna(sma.iloc[-1]) else 0,
+            'lower': float(lower.iloc[-1]) if not pd.isna(lower.iloc[-1]) else 0
+        }
+
+    @staticmethod
+    def calculate_mfi(df: pd.DataFrame, period: int = 14) -> float:
+        """MFI (Money Flow Index) 계산"""
+        if df is None or len(df) < period + 1:
+            return 50.0
+
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        money_flow = typical_price * df['volume']
+
+        # 상승/하락 판단
+        positive_flow = pd.Series(0, index=df.index)
+        negative_flow = pd.Series(0, index=df.index)
+
+        for i in range(1, len(df)):
+            if typical_price.iloc[i] > typical_price.iloc[i-1]:
+                positive_flow.iloc[i] = money_flow.iloc[i]
+            elif typical_price.iloc[i] < typical_price.iloc[i-1]:
+                negative_flow.iloc[i] = money_flow.iloc[i]
+
+        positive_mf = positive_flow.rolling(window=period).sum()
+        negative_mf = negative_flow.rolling(window=period).sum()
+
+        mfi_ratio = positive_mf / negative_mf
+        mfi = 100 - (100 / (1 + mfi_ratio))
+
+        return float(mfi.iloc[-1]) if not pd.isna(mfi.iloc[-1]) else 50.0
+
+
 class TradingEngine:
     """트레이딩 로직 담당 (ViewModel 역할)"""
 
@@ -212,7 +340,7 @@ class TradingEngine:
         self.kst = pytz.timezone('Asia/Seoul')
         self.logger = UnifiedLogger()
 
-        # Firebase 초기화 (웹 대시보드 동기화용)
+        # Firebase 초기화
         if not firebase_admin._apps:
             cred = credentials.Certificate(os.getenv('FIREBASE_ADMIN_KEY_PATH'))
             firebase_admin.initialize_app(cred)
@@ -223,27 +351,29 @@ class TradingEngine:
         if '-' not in account_no:
             account_no = f"{account_no}-01"
 
-        # 컴포넌트 초기화 (의존성 주입)
+        # 컴포넌트 초기화
         app_key = os.getenv('KIS_APP_KEY')
         app_secret = os.getenv('KIS_APP_SECRET')
 
-        # TokenManager 사용! (파일 직접 접근 X)
         self.token_manager = TokenManager(app_key, app_secret)
-
-        # API 클라이언트 생성
         self.api_client = KISApiClient(self.token_manager, account_no)
+        self.analyzer = TechnicalAnalyzer()
 
         # 트레이딩 설정
         self.buy_amount = 500000  # 종목당 50만원
         self.stop_loss_rate = -3.0  # 손절 -3%
         self.take_profit_rate = 5.0  # 익절 +5%
 
+        # RSI 기준값
+        self.rsi_oversold = 30  # 과매도
+        self.rsi_overbought = 70  # 과매수
+
     def sync_portfolio_to_firebase(self, portfolio: List[Dict]):
-        """포트폴리오를 Firebase에 동기화 (웹 대시보드용)"""
+        """포트폴리오를 Firebase에 동기화"""
         try:
             batch = self.db.batch()
 
-            # 기존 포트폴리오 문서 삭제
+            # 기존 포트폴리오 삭제
             existing_docs = self.db.collection('portfolio').stream()
             for doc in existing_docs:
                 batch.delete(doc.reference)
@@ -270,9 +400,9 @@ class TradingEngine:
             print(f"⚠️ Firebase 포트폴리오 동기화 실패: {e}")
 
     def sync_watchlist_to_firebase(self, watchlist: List[Dict]):
-        """감시종목을 Firebase에 동기화 (웹 대시보드용)"""
+        """감시종목을 Firebase에 동기화 (RSI/MFI 포함)"""
         try:
-            # market_scan/latest 문서에 업데이트
+            # market_scan/latest 업데이트
             doc_ref = self.db.collection('market_scan').document('latest')
             doc_ref.set({
                 'stocks': watchlist,
@@ -280,15 +410,13 @@ class TradingEngine:
                 'last_updated': datetime.now(self.kst).isoformat()
             })
 
-            # watchlist 컬렉션에도 개별 저장
+            # watchlist 컬렉션 업데이트
             batch = self.db.batch()
 
-            # 기존 watchlist 삭제
             existing_docs = self.db.collection('watchlist').stream()
             for doc in existing_docs:
                 batch.delete(doc.reference)
 
-            # 새 watchlist 추가
             for item in watchlist:
                 doc_ref = self.db.collection('watchlist').document(item['code'])
                 batch.set(doc_ref, {
@@ -297,24 +425,76 @@ class TradingEngine:
                 })
 
             batch.commit()
-            print(f"✅ 감시종목 {len(watchlist)}개 Firebase 동기화 완료")
+            print(f"✅ 감시종목 {len(watchlist)}개 Firebase 동기화 완료 (RSI 포함)")
         except Exception as e:
             print(f"⚠️ Firebase 감시종목 동기화 실패: {e}")
 
-    def sync_account_to_firebase(self, cash_balance: float = 0):
+    def sync_account_to_firebase(self, cash_balance: float, total_assets: float):
         """계좌 정보를 Firebase에 동기화"""
         try:
             doc_ref = self.db.collection('account').document('summary')
             doc_ref.set({
                 'cash_balance': cash_balance,
+                'total_assets': total_assets,
                 'last_updated': firestore.SERVER_TIMESTAMP
             }, merge=True)
+            print(f"✅ 계좌 정보 동기화: 현금 {cash_balance:,.0f}원, 총자산 {total_assets:,.0f}원")
         except Exception as e:
             print(f"⚠️ Firebase 계좌 동기화 실패: {e}")
 
+    def analyze_stock_with_indicators(self, stock_code: str, stock_info: Dict) -> Dict:
+        """종목에 대한 기술적 지표 계산"""
+        # 일봉 데이터 조회
+        df = self.api_client.get_daily_price_history(stock_code)
+
+        # 기술적 지표 계산
+        rsi = self.analyzer.calculate_rsi(df)
+        mfi = self.analyzer.calculate_mfi(df)
+        macd = self.analyzer.calculate_macd(df)
+        bollinger = self.analyzer.calculate_bollinger_bands(df)
+
+        # 매수 신호 판단
+        buy_signal = False
+        signal_reasons = []
+
+        # RSI 과매도 구간 (30 이하)
+        if rsi < self.rsi_oversold:
+            buy_signal = True
+            signal_reasons.append(f"RSI 과매도({rsi:.1f})")
+
+        # MACD 골든크로스
+        if macd['histogram'] > 0 and macd['macd'] > macd['signal']:
+            buy_signal = True
+            signal_reasons.append("MACD 골든크로스")
+
+        # 볼린저 밴드 하단 돌파
+        if stock_info['current_price'] < bollinger['lower']:
+            buy_signal = True
+            signal_reasons.append("볼린저 하단 돌파")
+
+        # 거래량 급증 + 상승
+        if stock_info['change_rate'] > 3.0 and stock_info['volume'] > 100000:
+            if rsi < self.rsi_overbought:  # RSI 과매수 구간이 아닐 때만
+                buy_signal = True
+                signal_reasons.append(f"거래량 급증({stock_info['volume']:,})")
+
+        return {
+            **stock_info,
+            'rsi': rsi,
+            'mfi': mfi,
+            'macd': macd['macd'],
+            'macd_signal': macd['signal'],
+            'macd_histogram': macd['histogram'],
+            'bollinger_upper': bollinger['upper'],
+            'bollinger_middle': bollinger['middle'],
+            'bollinger_lower': bollinger['lower'],
+            'buy_signal': buy_signal,
+            'signal_reasons': ', '.join(signal_reasons) if signal_reasons else '없음'
+        }
+
     def find_buy_opportunities(self) -> List[Dict]:
-        """매수 기회 탐색"""
-        print("🔍 매수 기회 탐색 중...")
+        """매수 기회 탐색 (RSI/MFI 포함)"""
+        print("🔍 매수 기회 탐색 중 (기술적 지표 분석 포함)...")
 
         # 거래량 상위 종목 조회
         volume_stocks = self.api_client.get_volume_ranking()
@@ -323,50 +503,72 @@ class TradingEngine:
             return []
 
         opportunities = []
-        for stock in volume_stocks[:10]:  # TOP 10만 체크
+
+        # 상위 10종목에 대해 상세 분석
+        for i, stock in enumerate(volume_stocks[:10], 1):
             stock_code = stock.get('mksc_shrn_iscd', '').zfill(6)
             if not stock_code or stock_code == '000000':
                 continue
 
+            print(f"  [{i}/10] {stock_code} 분석 중...")
+
             # 현재가 조회
             price_data = self.api_client.get_stock_price(stock_code)
             if price_data:
-                # 매수 조건: 3%+ 상승, 10만주+ 거래, 1000원+ 가격
-                if (price_data['change_rate'] > 3.0 and
-                    price_data['volume'] > 100000 and
-                    price_data['current_price'] >= 1000):
+                # 기술적 지표 계산 및 분석
+                analyzed_data = self.analyze_stock_with_indicators(stock_code, price_data)
 
-                    opportunities.append(price_data)
-                    print(f"  💡 발견: {price_data['name']} - "
-                          f"{price_data['change_rate']:+.1f}%, "
-                          f"{price_data['volume']:,}주")
+                # 매수 신호가 있는 종목만 추가
+                if analyzed_data['buy_signal']:
+                    opportunities.append(analyzed_data)
+                    print(f"    💡 매수 신호 발견: {analyzed_data['name']}")
+                    print(f"       - RSI: {analyzed_data['rsi']:.1f}, MFI: {analyzed_data['mfi']:.1f}")
+                    print(f"       - 신호: {analyzed_data['signal_reasons']}")
+                else:
+                    print(f"    ⚪ {analyzed_data['name']}: RSI {analyzed_data['rsi']:.1f} (신호 없음)")
 
-            time.sleep(0.2)  # API 부하 방지
+            time.sleep(0.3)  # API 부하 방지
 
+        print(f"📊 총 {len(opportunities)}개 매수 기회 발견")
         return opportunities
 
-    def check_sell_conditions(self) -> List[Dict]:
-        """매도 조건 체크"""
-        print("📊 포트폴리오 체크 중...")
+    def check_sell_conditions(self, portfolio: List[Dict]) -> List[Dict]:
+        """매도 조건 체크 (RSI 포함)"""
+        print("📊 포트폴리오 매도 조건 체크 중...")
 
-        portfolio = self.api_client.get_portfolio()
         sell_list = []
 
         for holding in portfolio:
+            stock_code = holding['stock_code']
             profit_rate = holding['profit_rate']
-            print(f"  📈 {holding['stock_name']}: {profit_rate:+.2f}%")
+
+            # 일봉 데이터로 RSI 계산
+            df = self.api_client.get_daily_price_history(stock_code)
+            rsi = self.analyzer.calculate_rsi(df)
+
+            print(f"  📈 {holding['stock_name']}: 수익률 {profit_rate:+.2f}%, RSI {rsi:.1f}")
+
+            sell_reason = None
 
             # 손절 조건
             if profit_rate <= self.stop_loss_rate:
-                holding['reason'] = f'손절 ({profit_rate:.2f}%)'
-                sell_list.append(holding)
+                sell_reason = f'손절 ({profit_rate:.2f}%)'
                 print(f"    🔴 손절 대상")
 
             # 익절 조건
             elif profit_rate >= self.take_profit_rate:
-                holding['reason'] = f'익절 ({profit_rate:.2f}%)'
-                sell_list.append(holding)
+                sell_reason = f'익절 ({profit_rate:.2f}%)'
                 print(f"    🟢 익절 대상")
+
+            # RSI 과매수 구간에서 추가 매도 검토
+            elif rsi > self.rsi_overbought and profit_rate > 0:
+                sell_reason = f'RSI 과매수 익절 ({rsi:.1f})'
+                print(f"    🟡 RSI 과매수 매도 대상")
+
+            if sell_reason:
+                holding['reason'] = sell_reason
+                holding['rsi'] = rsi
+                sell_list.append(holding)
 
         return sell_list
 
@@ -378,16 +580,13 @@ class TradingEngine:
         print(f"{'='*60}")
 
         # 1. 포트폴리오 조회 및 Firebase 동기화
-        portfolio = self.api_client.get_portfolio()
+        portfolio, cash, total_assets = self.api_client.get_portfolio()
         if portfolio:
             self.sync_portfolio_to_firebase(portfolio)
-
-        # 계좌 잔고도 동기화 (예수금 정보 업데이트)
-        # TODO: get_portfolio에서 예수금도 반환하도록 수정 필요
-        self.sync_account_to_firebase()
+        self.sync_account_to_firebase(cash, total_assets)
 
         # 2. 매도 조건 체크 및 실행
-        sell_opportunities = self.check_sell_conditions()
+        sell_opportunities = self.check_sell_conditions(portfolio)
         for item in sell_opportunities:
             print(f"\n💰 {item['reason']} 매도: {item['stock_name']}")
             success = self.api_client.sell_stock(
@@ -407,20 +606,37 @@ class TradingEngine:
             self.sync_watchlist_to_firebase(buy_opportunities)
 
         # 4. 매수 실행
+        portfolio_codes = [p['stock_code'] for p in portfolio]
+
         for item in buy_opportunities[:2]:  # 최대 2종목
+            # 이미 보유 중인 종목은 제외
+            if item['code'] in portfolio_codes:
+                continue
+
+            # 잔고 확인
+            if cash < self.buy_amount:
+                print(f"⚠️ 잔고 부족: {cash:,.0f}원 < {self.buy_amount:,.0f}원")
+                break
+
             quantity = int(self.buy_amount / item['current_price'])
             if quantity > 0:
                 print(f"\n💸 매수 실행: {item['name']} - {quantity}주")
+                print(f"   RSI: {item['rsi']:.1f}, MFI: {item['mfi']:.1f}")
+                print(f"   신호: {item['signal_reasons']}")
+
                 success = self.api_client.buy_stock(
                     item['code'],
                     quantity
                 )
                 if success:
                     print(f"  ✅ 매수 완료: {quantity}주 @ {item['current_price']:,.0f}원")
+                    cash -= self.buy_amount  # 잔고 차감
                     self.logger.trade(f"매수 완료: {item['name']}", {
                         'code': item['code'],
                         'quantity': quantity,
-                        'price': item['current_price']
+                        'price': item['current_price'],
+                        'rsi': item['rsi'],
+                        'signal': item['signal_reasons']
                     })
                 else:
                     print(f"  ❌ 매수 실패")
@@ -430,9 +646,9 @@ class TradingEngine:
 
     def run(self):
         """메인 실행 루프"""
-        self.logger.system("🚀 자동매매 봇 시작 (MVVM 패턴)")
-        print("📋 매수 조건: 3%+ 상승, 10만주+ 거래, 1000원+ 가격")
-        print("📋 매도 조건: 손절 -3%, 익절 +5%")
+        self.logger.system("🚀 자동매매 봇 시작 (RSI/MFI 지표 포함)")
+        print("📋 매수 조건: RSI < 30 또는 MACD 골든크로스 또는 거래량 급증")
+        print("📋 매도 조건: 손절 -3%, 익절 +5%, RSI > 70")
         print("-" * 60)
 
         cycle_count = 0
