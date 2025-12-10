@@ -14,6 +14,10 @@ import pytz
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 
+# Firebase 추가
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 # 기존 모듈들 재사용 (중복 제거!)
 from token_manager import TokenManager
 from logger_system import UnifiedLogger
@@ -208,6 +212,12 @@ class TradingEngine:
         self.kst = pytz.timezone('Asia/Seoul')
         self.logger = UnifiedLogger()
 
+        # Firebase 초기화 (웹 대시보드 동기화용)
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(os.getenv('FIREBASE_ADMIN_KEY_PATH'))
+            firebase_admin.initialize_app(cred)
+        self.db = firestore.client()
+
         # 계좌 정보
         account_no = os.getenv('KIS_ACCOUNT_NUMBER')
         if '-' not in account_no:
@@ -227,6 +237,80 @@ class TradingEngine:
         self.buy_amount = 500000  # 종목당 50만원
         self.stop_loss_rate = -3.0  # 손절 -3%
         self.take_profit_rate = 5.0  # 익절 +5%
+
+    def sync_portfolio_to_firebase(self, portfolio: List[Dict]):
+        """포트폴리오를 Firebase에 동기화 (웹 대시보드용)"""
+        try:
+            batch = self.db.batch()
+
+            # 기존 포트폴리오 문서 삭제
+            existing_docs = self.db.collection('portfolio').stream()
+            for doc in existing_docs:
+                batch.delete(doc.reference)
+
+            # 새 포트폴리오 추가
+            for item in portfolio:
+                doc_ref = self.db.collection('portfolio').document(item['stock_code'])
+                data = {
+                    'code': item['stock_code'],
+                    'name': item['stock_name'],
+                    'quantity': item['quantity'],
+                    'buy_price': item['buy_price'],
+                    'current_price': item['current_price'],
+                    'profit_rate': item['profit_rate'],
+                    'profit_amount': item.get('profit_loss', 0),
+                    'total_value': item['current_price'] * item['quantity'],
+                    'last_updated': firestore.SERVER_TIMESTAMP
+                }
+                batch.set(doc_ref, data)
+
+            batch.commit()
+            print("✅ 포트폴리오 Firebase 동기화 완료")
+        except Exception as e:
+            print(f"⚠️ Firebase 포트폴리오 동기화 실패: {e}")
+
+    def sync_watchlist_to_firebase(self, watchlist: List[Dict]):
+        """감시종목을 Firebase에 동기화 (웹 대시보드용)"""
+        try:
+            # market_scan/latest 문서에 업데이트
+            doc_ref = self.db.collection('market_scan').document('latest')
+            doc_ref.set({
+                'stocks': watchlist,
+                'scan_time': firestore.SERVER_TIMESTAMP,
+                'last_updated': datetime.now(self.kst).isoformat()
+            })
+
+            # watchlist 컬렉션에도 개별 저장
+            batch = self.db.batch()
+
+            # 기존 watchlist 삭제
+            existing_docs = self.db.collection('watchlist').stream()
+            for doc in existing_docs:
+                batch.delete(doc.reference)
+
+            # 새 watchlist 추가
+            for item in watchlist:
+                doc_ref = self.db.collection('watchlist').document(item['code'])
+                batch.set(doc_ref, {
+                    **item,
+                    'last_updated': firestore.SERVER_TIMESTAMP
+                })
+
+            batch.commit()
+            print(f"✅ 감시종목 {len(watchlist)}개 Firebase 동기화 완료")
+        except Exception as e:
+            print(f"⚠️ Firebase 감시종목 동기화 실패: {e}")
+
+    def sync_account_to_firebase(self, cash_balance: float = 0):
+        """계좌 정보를 Firebase에 동기화"""
+        try:
+            doc_ref = self.db.collection('account').document('summary')
+            doc_ref.set({
+                'cash_balance': cash_balance,
+                'last_updated': firestore.SERVER_TIMESTAMP
+            }, merge=True)
+        except Exception as e:
+            print(f"⚠️ Firebase 계좌 동기화 실패: {e}")
 
     def find_buy_opportunities(self) -> List[Dict]:
         """매수 기회 탐색"""
@@ -287,13 +371,18 @@ class TradingEngine:
         return sell_list
 
     def execute_trades(self):
-        """매매 실행"""
+        """매매 실행 및 Firebase 동기화"""
         now = datetime.now(self.kst)
         print(f"\n{'='*60}")
         print(f"🤖 자동매매 실행 - {now.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
 
-        # 1. 매도 먼저 실행
+        # 1. 포트폴리오 조회 및 Firebase 동기화
+        portfolio = self.api_client.get_portfolio()
+        if portfolio:
+            self.sync_portfolio_to_firebase(portfolio)
+
+        # 2. 매도 조건 체크 및 실행
         sell_opportunities = self.check_sell_conditions()
         for item in sell_opportunities:
             print(f"\n💰 {item['reason']} 매도: {item['stock_name']}")
@@ -308,8 +397,12 @@ class TradingEngine:
                 print(f"  ❌ 매도 실패")
             time.sleep(1)
 
-        # 2. 매수 실행
+        # 3. 매수 기회 탐색 및 Firebase 동기화
         buy_opportunities = self.find_buy_opportunities()
+        if buy_opportunities:
+            self.sync_watchlist_to_firebase(buy_opportunities)
+
+        # 4. 매수 실행
         for item in buy_opportunities[:2]:  # 최대 2종목
             quantity = int(self.buy_amount / item['current_price'])
             if quantity > 0:
