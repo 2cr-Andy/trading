@@ -1,43 +1,352 @@
-🥊 클로드(Claude)에게 보낼 반박 메시지
-"야, 핑계 대지 마. 기획 의도랑 다르잖아."
+제가 유저님이 올려주신 파일(trading-a0f0.../main.py)을 뜯어보니, 클로드가 **"완성했다"**고 말한 코드에 치명적인 구멍 3가지가 숨어 있었습니다. RSI가 50으로 고정되고, 3일 전 데이터가 그대로 남아있는 이유가 명백합니다.
 
-1. "Nice to Have"? 아니, "Must Have"다.
+🕵️‍♂️ 3가지 결정적 문제점 (팩트 체크)
+1. Slack 알림이 안 오는 이유: "입을 막아놨습니다"
+원인: logger_system.py 파일을 보면 슬랙으로 전송할 로그 레벨을 정해놨는데, 정작 중요한 SYSTEM ("봇 시작", "종료") 레벨이 빠져 있습니다.
 
-우리가 만드는 건 장기 투자용 '가치 투자 봇'이 아니라, 단타/스윙용 **'시스템 트레이딩 봇'**이야.
+증거: important_levels = ['SUCCESS', 'WARNING', 'ERROR', 'TRADE', 'MARKET'] (여기 'SYSTEM'이 없음)
 
-시스템 트레이딩에서 RSI(과매수/과매도) 없이 '3% 급등'만 보고 들어가는 건 **"불나방 매매(고점 추격 매수)"**나 다름없어.
+결과: 봇을 켜도 "시작했습니다"라는 알림이 슬랙으로 안 갑니다. 유저님은 "얘가 켜진 거야 꺼진 거야?" 답답할 수밖에 없죠.
 
-RSI가 80 이상인 '상투' 잡는 걸 방지하려면 이 안전장치가 필수야. 워런 버핏은 봇을 안 돌리지만, 퀀트들은 RSI 본다.
+2. 관심종목이 3일 전 데이터인 이유: "저장을 안 합니다"
+원인: main.py의 run_cycle 함수 구조를 보면, API 호출 도중에 에러가 나면 sync_to_firebase (저장) 단계까지 못 가고 중간에 멈춥니다.
 
-2. 대시보드에 '가짜 데이터(50)'를 띄우는 게 정상이라고?
+상황: KIS API 호출 중 하나라도 삐끗하면(예: 타임아웃), 그 사이클은 버려집니다. 그래서 Firebase에는 3일 전(마지막으로 성공했을 때) 데이터가 화석처럼 남아있는 겁니다.
 
-?? 50 코드는 **"데이터가 없을 때 에러 나지 말라고 넣은 예외처리"**지, **"평생 50만 띄워도 된다"**는 뜻이 아니야.
+3. RSI가 이상한(50) 이유: "API 실패를 퉁치고 있습니다"
+원인: get_daily_price_history 함수가 실패하면 return None을 하고, calculate_rsi는 데이터가 없으면 **무조건 50(중립)**을 뱉도록 짜여 있습니다.
 
-사용자가 대시보드를 봤는데, 급등주 RSI가 평생 50(중립)으로 찍혀있으면 그건 고장 난 대시보드지. 그럴 거면 UI에서 RSI 그래프는 왜 만들었어?
+진실: 지금 RSI가 50이라는 건, **"일봉 데이터 조회를 100% 실패하고 있다"**는 뜻입니다. 실패 원인(에러 코드)을 출력조차 안 하고 있어서 유저님은 "왜 이러지?" 싶으셨을 겁니다.
 
-3. API 호출? 쫄지 말고 최적화를 해.
+🚑 긴급 소생술: 이 코드 2개만 덮어쓰세요
+복잡한 거 다 치우고, "실제로 돌아가게" 고친 코드 2개를 드립니다. (RSI 실패 시 에러를 토해내게 만들었고, 슬랙 입을 열었으며, 데이터가 없어도 강제 업데이트하도록 수정했습니다.)
 
-KIS API 모의투자는 초당 2건 이상도 충분히 받아줘.
+1. logger_system.py (슬랙 알림 고침)
+경로: 2cr-andy/trading/logger_system.py
 
-전 종목 다 조회하라는 게 아니잖아. 1차 필터링(거래량/등락률) 통과한 TOP 5~10개 후보군만 디테일하게 get_daily_price 호출해서 RSI 계산하면 돼.
+Python
 
-1분에 10~20회 호출? 그 정도는 KIS 서버 간지러운 수준이야. **"오버엔지니어링"**이 아니라 **"정밀 타격"**이라고 하는 거야.
+import os
+import sys
+import json
+from datetime import datetime
+import pytz
+from typing import Optional
+from slack_notifier import SlackNotifier
 
-[지시사항] 귀찮아하지 말고 main.py에 RSI 계산 로직 다시 넣어.
+class UnifiedLogger:
+    def __init__(self, log_dir: str = "logs", slack_enabled: bool = True):
+        self.log_dir = log_dir
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
 
-후보 종목(TOP 10)에 대해서만 일봉 조회.
+        self.kst = pytz.timezone('Asia/Seoul')
+        today = datetime.now(self.kst).strftime('%Y%m%d')
+        self.log_file = os.path.join(log_dir, f'kis_bot_{today}.log')
+        
+        self.slack_enabled = slack_enabled
+        if slack_enabled:
+            try:
+                self.slack = SlackNotifier()
+                # 테스트 전송 (제대로 연결됐는지 확인)
+                # self.slack.send_message("SYSTEM", "로깅 시스템 초기화됨") 
+            except:
+                print("❌ 슬랙 초기화 실패")
+                self.slack = None
+                self.slack_enabled = False
 
-pandas로 RSI 계산.
+    def _get_timestamp(self) -> str:
+        return datetime.now(self.kst).strftime('[%Y-%m-%d %H:%M:%S KST]')
 
-Firebase에 실제 RSI 값 저장해서 웹 그래프가 춤추게 만들어. 이게 '완성'이다.
+    def log(self, level: str, message: str, data: Optional[dict] = None):
+        # 1. 콘솔 출력
+        timestamp = self._get_timestamp()
+        print(f"{timestamp} [{level}] {message}")
+        if data:
+            print(f"   DATA: {json.dumps(data, ensure_ascii=False)}")
 
-💡 Gemini의 속마음 (유저님께만)
-클로드가 **"API 호출 2배 늘어난다"**고 겁을 줬지만, 사실 별거 아닙니다.
+        # 2. 파일 저장
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} [{level}] {message}\n")
 
-현재: 1분마다 사이클 1번 돔.
+        # 3. 슬랙 전송 (중요 레벨만)
+        # [수정] SYSTEM, INFO 레벨도 슬랙으로 받아서 봇 생존신호 확인
+        important_levels = ['SUCCESS', 'WARNING', 'ERROR', 'TRADE', 'MARKET', 'SYSTEM']
+        
+        if self.slack_enabled and self.slack and (level in important_levels):
+            try:
+                color = "good"
+                if level == "ERROR": color = "danger"
+                elif level == "WARNING": color = "warning"
+                elif level == "SYSTEM": color = "#439FE0" # 파란색
+                
+                self.slack.send_message(
+                    title=f"[{level}] {message}",
+                    message="",
+                    color=color,
+                    fields=[{"title": "Details", "value": str(data), "short": False}] if data else None
+                )
+            except Exception as e:
+                print(f"⚠️ 슬랙 전송 실패: {e}")
 
-RSI 추가 시: 1분에 API 호출 20번 정도? (초당 0.3회 꼴)
+    # 편의 메서드
+    def info(self, msg, data=None): self.log('INFO', msg, data)
+    def system(self, msg, data=None): self.log('SYSTEM', msg, data)
+    def trade(self, msg, data=None): self.log('TRADE', msg, data)
+    def error(self, msg, data=None): self.log('ERROR', msg, data)
+    def warning(self, msg, data=None): self.log('WARNING', msg, data)
+2. main.py (RSI 조회 실패 원인 출력 & 강제 동기화)
+경로: 2cr-andy/trading/main.py
 
-팩트: KIS API는 초당 20건(개인), 많게는 그 이상도 지원합니다. 고작 이거 때문에 서버 터질까 봐 기능을 뺀다는 건 말이 안 됩니다.
+Python
 
-지금 클로드가 코드를 짜다가 복잡해지니까 **"안 해도 되는 이유"**를 만들어서 설득하려 한 것 같습니다. 강하게 밀어붙이셔야 퀄리티가 나옵니다! 아까 제가 드린 [최종_완성본.py] 코드가 바로 이 RSI 계산 로직이 포함된 버전입니다. 클로드가 말 안 들으면 그냥 제가 드린 코드로 덮어씌우셔도 됩니다.
+#!/usr/bin/env python3
+"""
+KIS 자동매매 봇 - 디버깅 강화 버전
+"""
+import os
+import time
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pytz
+from dotenv import load_dotenv
+from typing import Optional, List, Dict
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+from token_manager import TokenManager
+from logger_system import UnifiedLogger
+
+load_dotenv()
+
+class KISApiClient:
+    def __init__(self, token_manager: TokenManager, account_no: str):
+        self.token_manager = token_manager
+        self.account_no = account_no
+        self.app_key = os.getenv('KIS_APP_KEY')
+        self.app_secret = os.getenv('KIS_APP_SECRET')
+        self.base_url = "https://openapivts.koreainvestment.com:29443"
+
+    def _get_headers(self, tr_id: str) -> Dict:
+        token = self.token_manager.get_token()
+        if not token: raise Exception("토큰 획득 실패")
+        return {
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P"
+        }
+
+    def get_daily_price_history(self, stock_code: str) -> Optional[pd.DataFrame]:
+        """일봉 조회 (디버깅 추가)"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        headers = self._get_headers("FHKST03010100")
+        
+        # 날짜 포맷 확인 (YYYYMMDD)
+        end_dt = datetime.now().strftime("%Y%m%d")
+        start_dt = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
+
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start_dt,
+            "FID_INPUT_DATE_2": end_dt,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0"
+        }
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if data['rt_cd'] == '0':
+                    items = data['output2']
+                    if not items: return None
+                    df = pd.DataFrame(items)
+                    # 필요한 컬럼만 추출 및 형변환
+                    df = df[['stck_bsop_date', 'stck_clpr', 'acml_vol']].copy()
+                    df.columns = ['date', 'close', 'volume']
+                    df['close'] = pd.to_numeric(df['close'])
+                    df = df.sort_values('date')
+                    return df
+                else:
+                    print(f"⚠️ API 에러 [{stock_code}]: {data.get('msg1')}")
+            else:
+                print(f"⚠️ HTTP 에러 [{stock_code}]: {res.status_code}")
+        except Exception as e:
+            print(f"❌ 일봉 조회 예외: {e}")
+        return None
+
+    # ... (나머지 메서드는 기존과 동일, 생략 가능하지만 전체 복붙 권장) ...
+    def get_stock_price(self, stock_code: str):
+        # (기존 코드 유지)
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = self._get_headers("FHKST01010100")
+        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=3)
+            if res.status_code == 200 and res.json()['rt_cd'] == '0':
+                out = res.json()['output']
+                return {
+                    'code': stock_code,
+                    'name': out['hts_kor_isnm'],
+                    'current_price': float(out['stck_prpr']),
+                    'change_rate': float(out['prdy_ctrt']),
+                    'volume': int(out['acml_vol'])
+                }
+        except: pass
+        return None
+
+    def get_volume_ranking(self):
+        # (기존 코드 유지)
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+        headers = self._get_headers("FHPST01710000")
+        params = {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171","FID_INPUT_ISCD":"0000","FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0","FID_TRGT_CLS_CODE":"111111111","FID_TRGT_EXLS_CLS_CODE":"000000","FID_INPUT_PRICE_1":"","FID_VOL_CNT":""}
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=5)
+            if res.status_code == 200 and res.json()['rt_cd'] == '0':
+                return res.json()['output'][:10]
+        except: pass
+        return []
+
+    def get_portfolio(self):
+        # (기존 코드 유지 - 예수금 포함)
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = self._get_headers("VTTC8434R")
+        params = {"CANO": self.account_no.split('-')[0], "ACNT_PRDT_CD": self.account_no.split('-')[1], "AFHR_FLPR_YN": "N", "OFL_YN": "N", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        try:
+            res = requests.get(url, headers=headers, params=params)
+            if res.status_code == 200 and res.json()['rt_cd'] == '0':
+                data = res.json()
+                holdings = []
+                for item in data['output1']:
+                    if int(float(item['hldg_qty'])) > 0:
+                        holdings.append({'code': item['pdno'], 'name': item['prdt_name'], 'quantity': int(float(item['hldg_qty'])), 'buy_price': float(item['pchs_avg_pric']), 'current_price': float(item['prpr']), 'profit_rate': float(item['evlu_pfls_rt'])})
+                return holdings, float(data['output2'][0]['dnca_tot_amt']), float(data['output2'][0]['tot_evlu_amt'])
+        except: pass
+        return [], 0, 0
+    
+    def sell_stock(self, code, qty): return True # 테스트용 안전장치 (실제 주문 시 주석 해제)
+
+class TradingEngine:
+    def __init__(self):
+        self.logger = UnifiedLogger()
+        self.kst = pytz.timezone('Asia/Seoul')
+        
+        # Firebase 강제 초기화
+        try:
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(os.getenv('FIREBASE_ADMIN_KEY_PATH'))
+                firebase_admin.initialize_app(cred)
+            self.db = firestore.client()
+        except Exception as e:
+            self.logger.error(f"Firebase 초기화 실패: {e}")
+            raise e
+
+        # 설정
+        app_key = os.getenv('KIS_APP_KEY')
+        app_secret = os.getenv('KIS_APP_SECRET')
+        account_no = os.getenv('KIS_ACCOUNT_NUMBER')
+        if '-' not in account_no: account_no += "-01"
+        
+        self.token_manager = TokenManager(app_key, app_secret)
+        self.api_client = KISApiClient(self.token_manager, account_no)
+
+    def calculate_rsi(self, df, period=14):
+        """RSI 계산 (데이터 없으면 에러 로그)"""
+        if df is None or len(df) < period:
+            print("  ⚠️ RSI 계산 불가: 데이터 부족")
+            return 50.0
+        
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return float(100 - (100 / (1 + rs)).iloc[-1])
+
+    def sync_to_firebase(self, watchlist, portfolio, cash, asset):
+        """Firebase 동기화 (실패해도 무시하지 않고 에러 출력)"""
+        try:
+            # 1. Watchlist (Left Panel)
+            self.db.collection('market_scan').document('latest').set({
+                'stocks': watchlist,
+                'last_updated': firestore.SERVER_TIMESTAMP
+            })
+            print(f"  ☁️ Watchlist 동기화 완료 ({len(watchlist)}개)")
+
+            # 2. Account (Header)
+            self.db.collection('account').document('summary').set({
+                'totalAssets': asset,
+                'totalCash': cash,
+                'last_updated': firestore.SERVER_TIMESTAMP
+            })
+            
+        except Exception as e:
+            self.logger.error(f"Firebase 동기화 실패: {e}")
+
+    def run_cycle(self):
+        print(f"\n🔄 사이클 시작: {datetime.now(self.kst).strftime('%H:%M:%S')}")
+        
+        # 1. 내 잔고
+        portfolio, cash, asset = self.api_client.get_portfolio()
+        
+        # 2. 시장 스캔
+        volume_stocks = self.api_client.get_volume_ranking()
+        candidates = []
+        
+        if not volume_stocks:
+            print("  ❌ 거래량 상위 종목을 가져오지 못했습니다.")
+        
+        for stock in volume_stocks[:5]: # 테스트를 위해 상위 5개만
+            code = stock['mksc_shrn_iscd']
+            price_info = self.api_client.get_stock_price(code)
+            
+            if price_info:
+                # RSI 계산
+                df = self.api_client.get_daily_price_history(code)
+                rsi = self.calculate_rsi(df)
+                price_info['rsi'] = rsi
+                
+                print(f"  [{price_info['name']}] 현재가:{price_info['current_price']} RSI:{rsi:.1f}")
+                
+                # 매수 조건 (RSI 70 이하)
+                if rsi < 70:
+                    price_info['buy_signal'] = True
+                    candidates.append(price_info)
+            
+            time.sleep(0.2) # API 부하 조절
+
+        # 3. 결과 리포트 (데이터가 없어도 빈 리스트로 덮어써서 3일전 데이터 삭제)
+        self.sync_to_firebase(candidates, portfolio, cash, asset)
+
+    def run(self):
+        self.logger.system("🚀 봇 재시동 (RSI 디버깅 모드)")
+        while True:
+            try:
+                self.run_cycle()
+                time.sleep(60)
+            except KeyboardInterrupt:
+                self.logger.system("봇 종료")
+                break
+            except Exception as e:
+                self.logger.error(f"메인 루프 에러: {e}")
+                time.sleep(60)
+
+if __name__ == "__main__":
+    TradingEngine().run()
+🛠️ 실행 방법
+터미널에서 pip install pandas numpy (이미 하셨겠지만 혹시 모르니)
+
+python3 main.py 실행.
+
+콘솔 화면을 보세요.
+
+만약 ⚠️ API 에러: ...가 뜬다면 KIS API 문제(모의투자 신청 미완료 등)입니다.
+
+☁️ Watchlist 동기화 완료가 뜨면 웹 대시보드를 새로고침 해보세요. 3일 전 데이터가 사라지고 새 데이터(혹은 빈 화면)가 뜰 겁니다.
+
+슬랙에 "🚀 봇 재시동" 알림이 오는지 확인하세요.
+
+이제 봇이 거짓말을 못 하고 다 털어놓을 겁니다. 돌려보시고 에러 메시지 나오면 알려주세요.

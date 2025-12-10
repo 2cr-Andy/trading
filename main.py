@@ -48,7 +48,7 @@ class KISApiClient:
         }
 
     def get_daily_price_history(self, stock_code: str, days: int = 30) -> Optional[pd.DataFrame]:
-        """일봉 데이터 조회 (RSI/MACD 계산용)"""
+        """일봉 데이터 조회 (RSI/MACD 계산용) - 에러 상세 출력 추가"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         headers = self._get_headers("FHKST03010100")
 
@@ -79,8 +79,13 @@ class KISApiClient:
                     df['volume'] = df['acml_vol'].astype(float)
                     df = df.sort_values('date')
                     return df[['date', 'close', 'high', 'low', 'volume']]
+                else:
+                    # API 에러 코드 상세 출력
+                    print(f"❌ 일봉 API 에러 [{stock_code}]: {data.get('msg1', 'Unknown error')}")
+            else:
+                print(f"❌ HTTP {response.status_code} 에러 [{stock_code}]")
         except Exception as e:
-            print(f"⚠️ 일봉 데이터 조회 실패 ({stock_code}): {e}")
+            print(f"❌ 일봉 데이터 조회 예외 ({stock_code}): {e}")
         return None
 
     def get_stock_price(self, stock_code: str) -> Optional[Dict]:
@@ -250,6 +255,7 @@ class TechnicalAnalyzer:
     def calculate_rsi(df: pd.DataFrame, period: int = 14) -> float:
         """RSI (Relative Strength Index) 계산"""
         if df is None or len(df) < period + 1:
+            print(f"  ⚠️ RSI 계산 불가: 데이터 부족 (받은 데이터: {len(df) if df is not None else 0}행)")
             return 50.0  # 기본값
 
         delta = df['close'].diff()
@@ -579,31 +585,37 @@ class TradingEngine:
         print(f"🤖 자동매매 실행 - {now.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
 
-        # 1. 포트폴리오 조회 및 Firebase 동기화
-        portfolio, cash, total_assets = self.api_client.get_portfolio()
-        if portfolio:
-            self.sync_portfolio_to_firebase(portfolio)
-        self.sync_account_to_firebase(cash, total_assets)
+        try:
+            # 1. 포트폴리오 조회 및 Firebase 동기화
+            portfolio, cash, total_assets = self.api_client.get_portfolio()
+            if portfolio:
+                self.sync_portfolio_to_firebase(portfolio)
+            self.sync_account_to_firebase(cash, total_assets)
 
-        # 2. 매도 조건 체크 및 실행
-        sell_opportunities = self.check_sell_conditions(portfolio)
-        for item in sell_opportunities:
-            print(f"\n💰 {item['reason']} 매도: {item['stock_name']}")
-            success = self.api_client.sell_stock(
-                item['stock_code'],
-                item['quantity']
-            )
-            if success:
-                print(f"  ✅ 매도 완료: {item['quantity']}주")
-                self.logger.trade(f"매도 완료: {item['stock_name']}", item)
-            else:
-                print(f"  ❌ 매도 실패")
-            time.sleep(1)
+            # 2. 매도 조건 체크 및 실행
+            sell_opportunities = self.check_sell_conditions(portfolio)
+            for item in sell_opportunities:
+                print(f"\n💰 {item['reason']} 매도: {item['stock_name']}")
+                success = self.api_client.sell_stock(
+                    item['stock_code'],
+                    item['quantity']
+                )
+                if success:
+                    print(f"  ✅ 매도 완료: {item['quantity']}주")
+                    self.logger.trade(f"매도 완료: {item['stock_name']}", item)
+                else:
+                    print(f"  ❌ 매도 실패")
+                time.sleep(1)
 
-        # 3. 매수 기회 탐색 및 Firebase 동기화
-        buy_opportunities = self.find_buy_opportunities()
-        if buy_opportunities:
-            self.sync_watchlist_to_firebase(buy_opportunities)
+            # 3. 매수 기회 탐색 및 Firebase 동기화
+            buy_opportunities = self.find_buy_opportunities()
+
+            # 데이터가 없어도 강제로 Firebase 동기화 (3일 전 데이터 제거)
+            self.sync_watchlist_to_firebase(buy_opportunities if buy_opportunities else [])
+        except Exception as e:
+            self.logger.error(f"매매 실행 중 오류: {e}")
+            # 오류가 나도 빈 데이터로 Firebase 동기화 (화석 데이터 제거)
+            self.sync_watchlist_to_firebase([])
 
         # 4. 매수 실행
         portfolio_codes = [p['stock_code'] for p in portfolio]

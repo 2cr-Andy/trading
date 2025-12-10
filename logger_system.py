@@ -81,7 +81,8 @@ class UnifiedLogger:
             return
 
         # 중요한 레벨만 슬랙에 전송
-        important_levels = ['SUCCESS', 'WARNING', 'ERROR', 'TRADE', 'MARKET']
+        # SYSTEM 레벨 추가 - 봇 시작/종료 알림 받기 위해
+        important_levels = ['SUCCESS', 'WARNING', 'ERROR', 'TRADE', 'MARKET', 'SYSTEM']
         if level not in important_levels:
             return
 
